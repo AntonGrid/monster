@@ -27,7 +27,11 @@ robot:
 ## Quick start
 
 The package uses the same virtualenv as `ENRG-AI` (it imports that repository's
-oscillator and resolution gate, so there is one copy of the arithmetic):
+oscillator and resolution gate, so there is one copy of the arithmetic).  It
+finds that checkout as a sibling (`../ENRG-AI` or `../../ENRG-AI`); from
+anywhere else, point at it with `MONSTER_ENRG_AI=/path/to/ENRG-AI`.  The
+`monster.data` commands (`probe`, `capture`, `audit`, `gaps`, `derive`) import
+neither, so they run on a machine that only has this repository.
 
 ```bash
 cd monster
