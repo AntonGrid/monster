@@ -1,0 +1,18 @@
+{
+  "result": {
+    "category": "spot",
+    "list": [
+      {
+        "ask1Price": "35000.6000",
+        "ask1Size": "1.0",
+        "bid1Price": "34999.6000",
+        "bid1Size": "1.0",
+        "lastPrice": "35000.1000",
+        "symbol": "BTCUSDT"
+      }
+    ]
+  },
+  "retCode": 0,
+  "retMsg": "OK",
+  "time": 1794916800000
+}

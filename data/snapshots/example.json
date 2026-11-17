@@ -1,0 +1,18 @@
+{
+  "ts": 1700000000.0,
+  "source": "handwritten fixture: invented prices, not live data — every number here is for arithmetic, not for trading",
+  "quotes": [
+    {"venue": "htx", "symbol": "btcusdt", "bid": 34999.0, "ask": 35001.0, "ts": 1700000000.0},
+    {"venue": "okx", "symbol": "btcusdt", "bid": 35000.0, "ask": 35002.0, "ts": 1700000000.0},
+    {"venue": "bybit", "symbol": "btcusdt", "bid": 34998.5, "ask": 35000.5, "ts": 1700000000.0},
+    {"venue": "htx", "symbol": "btc-usdt-swap", "bid": 34995.0, "ask": 34997.0, "ts": 1700000000.0},
+    {"venue": "htx", "symbol": "ethusdt", "bid": 1999.0, "ask": 2001.0, "ts": 1700000000.0},
+    {"venue": "okx", "symbol": "ethusdt", "bid": 1999.5, "ask": 2001.5, "ts": 1700000000.0},
+    {"venue": "bybit", "symbol": "ethusdt", "bid": 1998.5, "ask": 2000.5, "ts": 1700000000.0},
+    {"venue": "htx", "symbol": "eth-usdt-swap", "bid": 1996.0, "ask": 1998.0, "ts": 1700000000.0}
+  ],
+  "funding": [
+    {"venue": "htx", "symbol": "btc-usdt-swap", "rate": 0.0005, "period_hours": 8.0, "ts": 1700000000.0},
+    {"venue": "htx", "symbol": "eth-usdt-swap", "rate": 0.0002, "period_hours": 8.0, "ts": 1700000000.0}
+  ]
+}

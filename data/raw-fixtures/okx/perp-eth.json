@@ -1,0 +1,16 @@
+{
+  "code": "0",
+  "data": [
+    {
+      "askPx": "1999.4000",
+      "askSz": "1.0",
+      "bidPx": "1998.2000",
+      "bidSz": "1.0",
+      "instId": "ETH-USDT-SWAP",
+      "instType": "SWAP",
+      "last": "1998.8000",
+      "ts": "1794916800000"
+    }
+  ],
+  "msg": ""
+}

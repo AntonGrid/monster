@@ -1,0 +1,16 @@
+[Unit]
+Description=ENRG Monster daily audit — re-parse yesterday's raw bodies and compare
+Documentation=file://<HOME>/entrain-core-workspace/monster/docs/VPS.md
+After=monster-capture.service
+
+[Service]
+Type=oneshot
+User=<USER>
+WorkingDirectory=<HOME>/entrain-core-workspace/monster
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/bin/mkdir -p <HOME>/entrain-core-workspace/monster/var/log
+# The day that has *closed*: today's file is still being appended to, and a
+# half-written gzip member reads as a corrupt store rather than a young one.
+ExecStart=/bin/sh -c 'exec <HOME>/entrain-core-workspace/monster/.venv/bin/python -m monster.data audit --store var/data --day "$(date -u -d yesterday +%%F)"'
+StandardOutput=append:<HOME>/entrain-core-workspace/monster/var/log/audit.log
+StandardError=append:<HOME>/entrain-core-workspace/monster/var/log/audit.log

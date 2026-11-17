@@ -1,0 +1,18 @@
+{
+  "ch": "market.ETH-USDT.detail.merged",
+  "status": "ok",
+  "tick": {
+    "ask": [
+      1999.0,
+      1.0
+    ],
+    "bid": [
+      1998.0,
+      1.0
+    ],
+    "close": 1998.5,
+    "id": 1,
+    "vol": 100.0
+  },
+  "ts": 1794916800000
+}

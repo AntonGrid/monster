@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "enrg-monster"
+version = "0.2.0"
+description = "ENRG Monster — the learning layer: recorded venue data, hash-chained telemetry, coherence truth detector, portfolio risk, paper execution"
+readme = "README.md"
+requires-python = ">=3.10"
+# The monster owns no maths of its own where the ecosystem already has it:
+# the Kuramoto arithmetic comes from ``ENRG-AI/agent/physics/oscillator.py``
+# and the resolution gate from ``ENRG-AI/agent/backtest/power.py``.  What this
+# package adds is the wiring, the journal and the refusals.
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["monster", "monster.*"]
+exclude = ["tests", "tests.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"

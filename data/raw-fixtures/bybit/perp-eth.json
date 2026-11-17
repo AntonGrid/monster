@@ -1,0 +1,20 @@
+{
+  "result": {
+    "category": "linear",
+    "list": [
+      {
+        "ask1Price": "1999.1000",
+        "ask1Size": "1.0",
+        "bid1Price": "1998.1000",
+        "bid1Size": "1.0",
+        "fundingRate": "0.000200",
+        "lastPrice": "1998.6000",
+        "nextFundingTime": "1794945600000",
+        "symbol": "ETHUSDT"
+      }
+    ]
+  },
+  "retCode": 0,
+  "retMsg": "OK",
+  "time": 1794916800000
+}

@@ -1,0 +1,18 @@
+{
+  "ch": "market.BTC-USDT.detail.merged",
+  "status": "ok",
+  "tick": {
+    "ask": [
+      35001.5,
+      1.0
+    ],
+    "bid": [
+      35000.5,
+      1.0
+    ],
+    "close": 35001.0,
+    "id": 1,
+    "vol": 100.0
+  },
+  "ts": 1794916800000
+}

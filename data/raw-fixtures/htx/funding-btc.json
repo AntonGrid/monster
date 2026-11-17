@@ -1,0 +1,9 @@
+{
+  "data": {
+    "contract_code": "BTC-USDT",
+    "funding_rate": "0.000500",
+    "funding_time": 1794945600000,
+    "settle_period": 8
+  },
+  "status": "ok"
+}

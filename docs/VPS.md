@@ -1,0 +1,282 @@
+# Неделя данных на VPS — инструкция для Антона
+
+Цель одна: **семь суток непрерывной записи HTX, OKX и Bybit**, из которой потом
+можно без оговорок строить предрегистрацию Funding Carry. Всё, что делает эта
+инструкция, — запускает уже написанный и протестированный сборщик и проверяет,
+что он пишет именно то, что должен.
+
+Ключи не нужны: все эндпоинты публичные, а пакет не умеет отправлять ордера.
+
+## 0. Что считается успехом
+
+Через 7 суток у нас должно быть:
+
+| Проверка | Команда | Порог |
+|---|---|---|
+| покрытие | `python -m monster.data gaps --store var/data --interval 60` | ≥ 98 % слотов у каждого `(биржа, символ)` |
+| воспроизводимость | `python -m monster.data audit --store var/data --day <день>` | 100 % ключей: raw → normalized |
+| сбор идёт | `tail var/log/capture.log` | строка в минуту, `18 reading(s), 18 raw body(ies)` |
+| журнал цел | `python -m monster.cycle --verify` | `ok (N events)` |
+
+Если покрытие ниже — это не «почти получилось»: это другой набор данных, и он
+будет назван, а не подтянут интерполяцией.
+
+## 1. Что должно быть на VPS
+
+```bash
+python3 --version                 # нужно >= 3.10
+timedatectl | grep -E 'synchronized|Time zone'   # часы обязаны быть синхронны
+df -h "$HOME"                     # нужно >= 2 GB свободно
+curl -s -o /dev/null -w '%{http_code}\n' 'https://api.hbdm.com/linear-swap-ex/market/detail/merged?contract_code=BTC-USDT'
+```
+
+**Часы — не формальность.** Время получения котировки пишем мы, а не биржа:
+если часы VPS уплывут, `derive` начнёт отвергать свежие котировки как старые
+(или принимать старые как свежие), и вся неделя будет измерять дрейф часов, а
+не рынок. `System clock synchronized: yes` — обязательное условие.
+
+Если `synchronized: no`:
+
+```bash
+sudo timedatectl set-ntp true && sudo systemctl restart systemd-timesyncd
+```
+
+## 2. Установка
+
+Сборщику нужен только Python и стандартная библиотека; `numpy`/`scipy` нужны
+только команде `monster.cycle`, но поставим всё, чтобы вечером не выяснять,
+чего не хватает.
+
+```bash
+mkdir -p "$HOME" && cd "$HOME"
+# вариант А: git — оба репозитория, чтобы работал monster.cycle (когерентность
+# берётся из ENRG-AI, одна копия арифметики на всю экосистему)
+git clone <repo-url-ENRG-AI> ENRG-AI
+git clone <repo-url> entrain-core-workspace
+# вариант Б: с ноутбука (без git-истории, только код)
+#   rsync -av --exclude '.venv' --exclude '__pycache__' \
+#     ~/entrain-core-workspace/monster/ anton@<vps>:~/entrain-core-workspace/monster/
+#   (ENRG-AI рядом: ~/ENRG-AI, либо MONSTER_ENRG_AI=/path/to/ENRG-AI)
+
+cd entrain-core-workspace/monster
+python3 -m venv .venv
+.venv/bin/pip install --upgrade pip
+.venv/bin/pip install -e .          # monster + numpy + scipy
+.venv/bin/python -m monster.data --help | head -3
+```
+
+> Команды `probe`, `capture`, `audit`, `gaps`, `derive` не импортируют
+> `ENRG-AI`: если соседнего репозитория на VPS нет, они работают всё равно.
+> `monster.cycle` ищет его в `../ENRG-AI`, `../../ENRG-AI` или по
+> `MONSTER_ENRG_AI`; `monster.cycle --verify` (проверка журнала) работает и без
+> него, а полный цикл без ENRG-AI честно откажется читать когерентность.
+
+## 3. Первый контакт: probe
+
+Один запрос к каждому из 18 эндпоинтов, без записи на диск, без ретраев.
+Здесь и только здесь видно, что биржа отвечает **той форме, которую мы
+разбираем**, а не просто `200`.
+
+```bash
+.venv/bin/python -m monster.data probe --live
+```
+
+Ждём ровно это (вывод с машины разработчика, 17.11.2026; на VPS числа и
+задержки будут другими, форма та же):
+
+```
+  [ok]   bybit funding-btc  +0.188 bps/8h               774 ms
+  [ok]   bybit spot-btc     63766.5 / 63766.6           542 ms
+  [ok]   htx   funding-btc  +1.000 bps/8h               798 ms
+  [ok]   htx   spot-btc     63799.4 / 63799.4          1283 ms
+  [ok]   okx   funding-btc  +0.257 bps/8h               750 ms
+  [ok]   okx   perp-btc     63745.6 / 63745.7           583 ms
+  ...
+probe: 18/18 endpoint(s) answered and parsed
+```
+
+Код выхода `0` — все 18. Если нет, смотри §8; запускать неделю при `17/18`
+нельзя, но и паниковать не нужно: `probe` ничего не испортил.
+
+## 4. Запуск на неделю
+
+Проход = 16 HTTP-запросов (18 чтений: у Bybit тикер один на спот, перп и
+фандинг) и ~1–2 с. Следующий проход стартует по абсолютной сетке, поэтому
+долгий ответ не сдвигает расписание: пропущенные слоты становятся `Gap`, а не
+«догоняющим залпом».
+
+```bash
+cd "$HOME/entrain-core-workspace/monster"
+mkdir -p var/log
+
+tmux new -s monster
+# внутри tmux:
+env PYTHONUNBUFFERED=1 .venv/bin/python -m monster.data capture \
+  --live --store var/data --interval 60 --count 10080 \
+  --journal var/journal.jsonl --fsync \
+  2>&1 | tee -a var/log/capture.log
+# отцепиться, оставив работать: Ctrl-b, затем d
+```
+
+`10080` = 7 суток × 24 ч × 60 мин — процесс сам завершится через неделю.
+Повторный запуск позже не испортит данные: дубликаты `(venue, symbol, ts)`
+отбрасываются, а расхождение под тем же ключом становится `Conflict`, а не
+средним.
+
+Проверить, что tmux жив и пишет:
+
+```bash
+tmux ls
+tmux attach -t monster          # посмотреть; выйти — Ctrl-b d
+```
+
+> `PYTHONUNBUFFERED=1` в команде — не украшение: при перенаправлении в файл
+> Python буферизует stdout блоками, и «лог пустой» не будет значить «сбор
+> стоит».
+
+
+### Вариант без tmux: systemd (переживает reboot)
+
+```bash
+sudo sed "s#<USER>#$USER#g; s#<HOME>#$HOME#g" \
+  deploy/monster-capture.service | sudo tee /etc/systemd/system/monster-capture.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now monster-capture
+systemctl status monster-capture --no-pager
+journalctl -u monster-capture -n 20 --no-pager
+```
+
+`Restart=always` означает, что падение стоит секунд, а не недели. В tmux
+такого нет — если выбираешь tmux, проверяй `tmux ls` хотя бы раз в день.
+
+Плюс ежедневный `audit` таймером (00:10 UTC, по вчерашнему дню):
+
+```bash
+sudo sed "s#<USER>#$USER#g; s#<HOME>#$HOME#g" deploy/monster-audit.service \
+  | sudo tee /etc/systemd/system/monster-audit.service
+sudo sed "s#<USER>#$USER#g; s#<HOME>#$HOME#g" deploy/monster-audit.timer \
+  | sudo tee /etc/systemd/system/monster-audit.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now monster-audit.timer
+systemctl list-timers monster-audit --no-pager
+```
+
+
+## 5. Ежедневная проверка (2 минуты)
+
+```bash
+cd "$HOME/entrain-core-workspace/monster"
+
+# 1. вчерашний день целиком воспроизводится из raw
+.venv/bin/python -m monster.data audit --store var/data \
+  --day "$(date -u -d yesterday +%F)"
+
+# 2. покрытие и дыры за всё время
+.venv/bin/python -m monster.data gaps --store var/data --interval 60
+
+# 3. сколько уже собрано
+du -sh var/data && ls var/data | tail -3
+```
+
+Cron (UTC, каждую ночь — по вчерашнему закрытому дню):
+
+```cron
+10 0 * * * cd $HOME/entrain-core-workspace/monster && .venv/bin/python -m monster.data audit --store var/data --day $(date -u -d yesterday +\%F) >> var/log/audit.log 2>&1
+20 0 * * * cd $HOME/entrain-core-workspace/monster && .venv/bin/python -m monster.data gaps --store var/data --interval 60 >> var/log/gaps.log 2>&1
+```
+
+Почему вчерашний, а не сегодняшний: файл сегодняшнего дня в этот момент ещё
+открыт на запись, и читать его — значит читать незакрытый gzip-член. Это не
+ошибка данных, это ошибка момента.
+
+## 6. Как читать отчёты
+
+```
+audit 2026-11-18: 17280/17280 keys agree (17280 raw bodies, 17280 parsed rows)
+```
+
+Проверено живыми данными (17.11.2026, три прохода, три биржи):
+`audit 2026-11-17: 54/54 keys agree`. Любая строка `only in raw`,
+`only normalized` или `mismatched` — стоп-сигнал: значит парсер сегодня читает
+тело иначе, чем вчера, и это надо разбирать до продолжения недели.
+
+```
+coverage htx btcusdt (spot): 97.9% of 1440 slots
+htx btcusdt (spot): 30 missing 60s slot(s) between ...
+```
+
+`coverage` — доля слотов, в которых было наблюдение; `gaps` — где именно.
+Пропуск — это отсутствие наблюдения, а не ноль: в данных не появится
+«цена 0.0», появится дырка с именем.
+
+Читать магазин можно и во время сбора: если ридер попал в момент, когда
+последний gzip-член ещё дописывается, файл перечитывается (несколько попыток
+по 50 мс), а не объявляется битым. `Store.reopens` считает такие гонки; если
+он растёт сотнями — диск не успевает, стоит уменьшить `--fsync`-частоту, а не
+доверие к данным. `audit` всё равно запускай по закрытому дню: у сегодняшнего
+дня ещё нет «вчера».
+
+## 7. Остановка, перезапуск, обновление
+
+Остановить: `tmux attach -t monster` → `Ctrl-C` (или `sudo systemctl stop monster-capture`).
+Данные уже на диске: каждый проход пишется с `fsync`.
+
+Перезапуск (например, после обновления кода):
+
+```bash
+cd "$HOME/entrain-core-workspace/monster"
+git pull                                         # или rsync заново
+.venv/bin/python -m monster.data probe --live     # форма ещё та?
+.venv/bin/python -m monster.cycle --verify        # журнал не правили?
+# затем снова команда из §4
+```
+
+Данные переживают обновление кода, но **не** переживают `git clean -fdx`:
+`var/` в `.gitignore`, поэтому git её не тронет, а `clean -x` — тронет.
+
+## 8. Если что-то не так
+
+| Симптом в `probe` / логе | Что это значит | Что делать |
+|---|---|---|
+| `HTTP Error 403` | биржа не любит наш `User-Agent` или IP-регион | `curl` с того же VPS; если 403 и там — вопрос к сети VPS, не к коду |
+| `HTTP Error 429` | слишком часто | `--interval 90` (покрытие считается по слотам, а не по запросам) |
+| `HTTP Error 451` | гео-ограничение | этот эндпоинт с VPS недоступен; писать Архитектору |
+| `the answer is not JSON` | вместо JSON — HTML (прокси, captive portal) | `curl` тот же URL; если HTML — виноват прокси/сеть |
+| `timeout` в каждом проходе | медленная сеть | `--timeout 8 --workers 4` |
+| `no day to audit` | день ещё не создан (или опечатка в `--day`) | `ls var/data` |
+| `BadGzipFile` при `audit` | читается сегодняшний, ещё открытый файл | аудитить вчерашний день |
+| `17 reading(s)` каждый раз | один эндпоинт отказал | в строке будет имя и причина — это и есть ценность |
+| `System clock synchronized: no` | часы уплыли | §1, и только потом продолжать |
+
+Важно: **одна отказавшая биржа не останавливает сбор**. В логе будет
+`17 reading(s)` и имя отказавшего эндпоинта; остальные 17 пишутся. Это
+задумано: неделя данных без OKX полезнее, чем никакой недели.
+
+## 9. Что прислать через 7 дней
+
+```bash
+cd "$HOME/entrain-core-workspace/monster"
+.venv/bin/python -m monster.data probe --live > var/probe.txt
+.venv/bin/python -m monster.data gaps --store var/data --interval 60 > var/gaps.txt
+for d in $(ls var/data); do
+  .venv/bin/python -m monster.data audit --store var/data --day "$d" >> var/audit.txt
+done
+.venv/bin/python -m monster.cycle --verify > var/journal.txt
+du -sh var/data >> var/journal.txt
+```
+
+Четыре файла — `probe.txt`, `gaps.txt`, `audit.txt`, `journal.txt` — и есть
+ответ на вопрос «прошла ли Фаза 1 свои ворота». Ничего не надо пересказывать
+словами: числа либо сходятся, либо нет.
+
+## 10. Чего не делать
+
+* не запускать `capture` от `root` — незачем; ключей у пакета нет;
+* не класть `.env` с ключами в этот каталог: сбор их не читает, а лишняя копия
+  секретов рядом с данными — риск без выгоды;
+* не менять `--interval` посреди недели: `gaps` считает по одному интервалу;
+* не «поправлять» файлы в `var/data` руками: `audit` поймает, а доверие к
+  неделе обнулится;
+* не удалять `var/journal.jsonl` — это единственная защита от тихой правки
+  истории (проверяется `monster.cycle --verify`).
+

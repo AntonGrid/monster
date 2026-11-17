@@ -1,0 +1,9 @@
+[Unit]
+Description=ENRG Monster audit, 00:10 UTC every day (after the previous UTC day closed)
+
+[Timer]
+OnCalendar=*-*-* 00:10:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
