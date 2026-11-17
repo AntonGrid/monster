@@ -1,0 +1,10 @@
+[Unit]
+Description=ENRG Monster probe, hourly: has a venue's payload shape moved?
+
+[Timer]
+OnCalendar=hourly
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

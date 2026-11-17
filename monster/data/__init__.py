@@ -47,6 +47,7 @@ from monster.data.probe import Probe, probe
 from monster.data.quality import Audit, Coverage, Gap, audit_day, coverage, find_gaps
 from monster.data.raw import RawPayload, ShapeError, decimal, pick, timestamp_s
 from monster.data.store import Batch, Conflict, Store, StoreError
+from monster.data.truth_report import TruthDay, TruthEvent, truth_day
 
 __all__ = [
     "Audit",
@@ -68,6 +69,8 @@ __all__ = [
     "StoreError",
     "Transport",
     "TransportError",
+    "TruthDay",
+    "TruthEvent",
     "UrllibTransport",
     "audit_day",
     "coverage",
@@ -80,4 +83,5 @@ __all__ = [
     "probe",
     "snapshot_from",
     "timestamp_s",
+    "truth_day",
 ]

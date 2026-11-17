@@ -30,12 +30,12 @@ The package uses the same virtualenv as `ENRG-AI` (it imports that repository's
 oscillator and resolution gate, so there is one copy of the arithmetic).  It
 finds that checkout as a sibling (`../ENRG-AI` or `../../ENRG-AI`); from
 anywhere else, point at it with `MONSTER_ENRG_AI=/path/to/ENRG-AI`.  The
-`monster.data` commands (`probe`, `capture`, `audit`, `gaps`, `derive`) import
+`monster.data` commands (`probe`, `capture`, `audit`, `gaps`, `truth-report`, `derive`) import
 neither, so they run on a machine that only has this repository.
 
 ```bash
 cd monster
-../ENRG-AI/.venv/bin/python -m pytest          # 160 tests, no network
+../ENRG-AI/.venv/bin/python -m pytest          # 167 tests, no network
 
 # 0. One question per endpoint: does the venue answer the shape we parse, or
 #    merely answer?  It writes nothing, so it is safe to run first.
@@ -200,12 +200,13 @@ monster/
       probe.py     one question per endpoint: answered, parsed, or refused
       store.py     gzip day files, dedupe, conflicts, queries
       quality.py   gaps, coverage, audit(raw vs normalized)
+      truth_report.py replay the truth check over a day; classify each finding
       derive.py    as-of snapshot, aligned history, notes
       synthetic.py a synthetic tape, labelled as such
   data/raw-fixtures/  venue-shaped bodies for offline parser/capture tests
   data/snapshots/     invented fixtures for the 0.1.0 frozen-snapshot run
   deploy/             systemd units for the capture week (see docs/VPS.md)
   docs/VPS.md         the operator runbook: install, probe, run, check, report
-  tests/              160 tests: every refusal has one
+  tests/              167 tests: every refusal has one
   docs/MONSTER.md     charter, roadmap, integration plan, non-negotiables
 ```

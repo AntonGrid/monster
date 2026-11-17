@@ -10,7 +10,10 @@ them from cron:
 ``derive``   prints (and optionally saves) the snapshot and history a cycle
              would see at ``--at``;
 ``audit``    re-parses a day of raw bodies and compares with the store;
-``gaps``     missing slots and coverage for a window.
+``gaps``     missing slots and coverage for a window;
+``truth-report`` replays the truth check over a day and classifies its findings
+             by what the next pass did — the instrument for the false-positive
+             gate, which cannot be measured at the moment of a refusal.
 
 Every command returns a process exit code: 0 when the answer is clean, 1 when
 it is not, 2 when the question could not be asked.  A cron job that ignores
@@ -31,6 +34,7 @@ from monster.data.probe import probe as probe_endpoints
 from monster.data.quality import audit_day, coverage, find_gaps
 from monster.data.store import Store, StoreError
 from monster.data.synthetic import write_demo_tape
+from monster.data.truth_report import truth_day
 from monster.journal import Journal, JournalError
 
 __all__ = ["main"]
@@ -199,6 +203,31 @@ def _gaps(args: argparse.Namespace) -> int:
     return 0 if not gaps else 1
 
 
+def _truth(args: argparse.Namespace) -> int:
+    store = Store(args.store)
+    try:
+        report = truth_day(
+            store,
+            args.day,
+            min_venues=args.min_venues,
+            z_threshold=args.z,
+            max_deviation_bps=args.max_deviation_bps,
+        )
+    except (DataError, StoreError) as error:
+        print(f"data: {error}", file=sys.stderr)
+        return 2
+    print(json.dumps(report.to_dict(), indent=2, sort_keys=True) if args.json else report.describe())
+    if args.max_fp_share is not None:
+        share = report.false_positive_share
+        if share is not None and share > args.max_fp_share:
+            print(
+                f"truth: false-positive share {share:.1%} exceeds {args.max_fp_share:.1%}",
+                file=sys.stderr,
+            )
+            return 1
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="monster-data", description="ENRG Monster data layer: record, replay, audit")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -277,6 +306,28 @@ def _parser() -> argparse.ArgumentParser:
     gaps.add_argument("--until", type=float)
     gaps.add_argument("--json", action="store_true")
     gaps.set_defaults(handler=_gaps)
+
+    truth = commands.add_parser(
+        "truth-report",
+        help="replay the truth check over a day: how often it fired, and how often it was noise",
+    )
+    truth.add_argument("--store", default="var/data")
+    truth.add_argument("--day", help="YYYY-MM-DD (default: the newest day)")
+    truth.add_argument("--min-venues", type=int, default=3, help="venues needed before disagreement can be judged")
+    truth.add_argument("--z", type=float, default=4.0, help="robust z above which a venue is flagged")
+    truth.add_argument(
+        "--max-deviation-bps",
+        type=float,
+        default=100.0,
+        help="flag when the others agree exactly and the venue is this far off",
+    )
+    truth.add_argument(
+        "--max-fp-share",
+        type=float,
+        help="exit 1 when the false-positive share of judged findings exceeds this (the gate is 0.01)",
+    )
+    truth.add_argument("--json", action="store_true")
+    truth.set_defaults(handler=_truth)
     return parser
 
 

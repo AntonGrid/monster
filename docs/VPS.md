@@ -164,6 +164,24 @@ sudo systemctl enable --now monster-audit.timer
 systemctl list-timers monster-audit --no-pager
 ```
 
+Плюс часовой `probe` — сторож формы ответов, а не данных:
+
+```bash
+sudo sed "s#<USER>#$USER#g; s#<HOME>#$HOME#g" deploy/monster-probe.service \
+  | sudo tee /etc/systemd/system/monster-probe.service
+sudo sed "s#<USER>#$USER#g; s#<HOME>#$HOME#g" deploy/monster-probe.timer \
+  | sudo tee /etc/systemd/system/monster-probe.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now monster-probe.timer
+tail -5 var/log/probe.log
+```
+
+Он ничего не пишет в магазин: спрашивает те же 18 эндпоинтов, разбирает их
+теми же парсерами и выходит с кодом 1, если форма ответа уехала. Биржа умеет
+отвечать `200` и другим телом — тогда сбор идёт, `audit` сам с собой согласен, а
+неделя ничего не стоит. Час — это цена раннего предупреждения; раз в неделю —
+цена того, что узнаёшь на восьмой день.
+
 
 ## 5. Ежедневная проверка (2 минуты)
 
@@ -179,6 +197,10 @@ cd "$HOME/entrain-core-workspace/monster"
 
 # 3. сколько уже собрано
 du -sh var/data && ls var/data | tail -3
+
+# 4. сработала ли truth-проверка там, где надо (FP-ворота Фазы 1)
+.venv/bin/python -m monster.data truth-report --store var/data \
+  --day "$(date -u -d yesterday +%F)"
 ```
 
 Cron (UTC, каждую ночь — по вчерашнему закрытому дню):
@@ -186,6 +208,7 @@ Cron (UTC, каждую ночь — по вчерашнему закрытом�
 ```cron
 10 0 * * * cd $HOME/entrain-core-workspace/monster && .venv/bin/python -m monster.data audit --store var/data --day $(date -u -d yesterday +\%F) >> var/log/audit.log 2>&1
 20 0 * * * cd $HOME/entrain-core-workspace/monster && .venv/bin/python -m monster.data gaps --store var/data --interval 60 >> var/log/gaps.log 2>&1
+30 0 * * * cd $HOME/entrain-core-workspace/monster && .venv/bin/python -m monster.data truth-report --store var/data --day $(date -u -d yesterday +\%F) >> var/log/truth.log 2>&1
 ```
 
 Почему вчерашний, а не сегодняшний: файл сегодняшнего дня в этот момент ещё
@@ -211,6 +234,21 @@ htx btcusdt (spot): 30 missing 60s slot(s) between ...
 `coverage` — доля слотов, в которых было наблюдение; `gaps` — где именно.
 Пропуск — это отсутствие наблюдения, а не ноль: в данных не появится
 «цена 0.0», появится дырка с именем.
+
+```
+truth 2026-11-18: 1440 pass(es), 5760 cross-section(s) judged · 3 finding(s): 1 persistent, 2 snapped back
+false positives: 2/3 judged = 66.7%, 3.47e-04 per cross-section (gate: under 1%)
+```
+
+`truth-report` проигрывает проверку по вчерашнему дню и судит каждое
+срабатывание по следующему проходу: `persistent` — биржа всё ещё не в толпе
+(отказ был прав), `others_followed` — толпа пришла к её цене (она была ранней,
+а не ошибочной), `snapped back` — вернулась, а толпа не двигалась (это шум),
+`unknown` — судить нечем (конец дня или биржи не было в следующем проходе).
+Шумом считается только `snapped back`; два числа — «доля шума среди
+проверенных срабатываний» и «шум на кросс-секцию» — отвечают на разные вопросы,
+и ворота Фазы 1 (FP < 1%) читаются по обоим. `--max-fp-share 0.01` превращает
+это в код выхода для cron.
 
 Читать магазин можно и во время сбора: если ридер попал в момент, когда
 последний gzip-член ещё дописывается, файл перечитывается (несколько попыток
@@ -266,11 +304,14 @@ for d in $(ls var/data); do
 done
 .venv/bin/python -m monster.cycle --verify > var/journal.txt
 du -sh var/data >> var/journal.txt
+for d in $(ls var/data); do
+  .venv/bin/python -m monster.data truth-report --store var/data --day "$d" --json >> var/truth.jsonl
+done
 ```
 
-Четыре файла — `probe.txt`, `gaps.txt`, `audit.txt`, `journal.txt` — и есть
-ответ на вопрос «прошла ли Фаза 1 свои ворота». Ничего не надо пересказывать
-словами: числа либо сходятся, либо нет.
+Пять файлов — `probe.txt`, `gaps.txt`, `audit.txt`, `journal.txt`,
+`truth.jsonl` — и есть ответ на вопрос «прошла ли Фаза 1 свои ворота». Ничего
+не надо пересказывать словами: числа либо сходятся, либо нет.
 
 ## 10. Чего не делать
 
@@ -278,6 +319,9 @@ du -sh var/data >> var/journal.txt
 * не класть `.env` с ключами в этот каталог: сбор их не читает, а лишняя копия
   секретов рядом с данными — риск без выгоды;
 * не менять `--interval` посреди недели: `gaps` считает по одному интервалу;
+* не менять **парсеры и нормализацию** до конца недели (см. §10 в
+  `docs/MONSTER.md`): `audit` сравнивает сегодняшний парсер со вчерашними
+  строками, и любое новое поле превращает честный день в `mismatched`;
 * не «поправлять» файлы в `var/data` руками: `audit` поймает, а доверие к
   неделе обнулится;
 * не удалять `var/journal.jsonl` — это единственная защита от тихой правки
