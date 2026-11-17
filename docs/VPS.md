@@ -48,17 +48,20 @@ sudo timedatectl set-ntp true && sudo systemctl restart systemd-timesyncd
 чего не хватает.
 
 ```bash
-mkdir -p "$HOME" && cd "$HOME"
+mkdir -p "$HOME/entrain-core-workspace" && cd "$HOME/entrain-core-workspace"
 # вариант А: git — оба репозитория, чтобы работал monster.cycle (когерентность
-# берётся из ENRG-AI, одна копия арифметики на всю экосистему)
-git clone <repo-url-ENRG-AI> ENRG-AI
-git clone <repo-url> entrain-core-workspace
+# берётся из ENRG-AI, одна копия арифметики на всю экосистему).
+# ENRG-AI должен лежать рядом с monster/ — мост ищет именно этот сосед.
+git clone https://github.com/AntonGrid/monster.git
+git clone https://github.com/AntonGrid/ENRG-AI.git
+# (по SSH — те же адреса с git@github.com:, если ключ на VPS есть;
+#  для приватного ENRG-AI без ключа используй токен в URL)
 # вариант Б: с ноутбука (без git-истории, только код)
 #   rsync -av --exclude '.venv' --exclude '__pycache__' \
 #     ~/entrain-core-workspace/monster/ anton@<vps>:~/entrain-core-workspace/monster/
-#   (ENRG-AI рядом: ~/ENRG-AI, либо MONSTER_ENRG_AI=/path/to/ENRG-AI)
+#   (ENRG-AI рядом: ~/entrain-core-workspace/ENRG-AI, либо MONSTER_ENRG_AI=/path/to/ENRG-AI)
 
-cd entrain-core-workspace/monster
+cd monster
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install -e .          # monster + numpy + scipy
