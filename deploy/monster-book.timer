@@ -1,0 +1,10 @@
+[Unit]
+Description=ENRG Monster book audit, hourly at :07 (verify both chains, then reconcile the cache)
+
+[Timer]
+OnCalendar=*-*-* *:07:00 UTC
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

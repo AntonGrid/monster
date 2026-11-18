@@ -13,7 +13,8 @@ robot:
 | Component | File | What it refuses |
 |---|---|---|
 | Contracts | `monster/contracts.py` | a crossed book, a duplicate quote, a reading from the future, an intent whose id does not match its content |
-| Journal | `monster/journal.py` | editing the past: every line is `sha256`-chained to the previous one |
+| Journal | `monster/journal.py` | editing the past: every line is `sha256`-chained to the previous one, and a second writer on the same chain |
+| Replay | `monster/replay.py` | a state cache that disagrees with the journal: the book is rebuilt and compared field by field, not averaged |
 | Coherence | `monster/brain/phase.py` | calling `R = 0.8` a crowd before asking what `R` looks like when the alignment is destroyed |
 | Truth check | `monster/brain/truth.py` | trading a stale quote, or a venue that disagrees with the robust cross-section |
 | Risk | `monster/risk/limits.py` | a projected book over the limits, a VaR from nine observations, a kill switch cleared by a process |
@@ -35,7 +36,7 @@ neither, so they run on a machine that only has this repository.
 
 ```bash
 cd monster
-../ENRG-AI/.venv/bin/python -m pytest          # 167 tests, no network
+../ENRG-AI/.venv/bin/python -m pytest          # 194 tests, no network
 
 # 0. One question per endpoint: does the venue answer the shape we parse, or
 #    merely answer?  It writes nothing, so it is safe to run first.
@@ -52,20 +53,27 @@ cd monster
 #    audit the store against its own raw bodies, then let the cycle derive its
 #    own snapshot and history.  On the VPS only the capture line changes:
 #    `--live --interval 60` instead of `--fixtures ... --at ...`.
+#    The collector writes its own chain (two writers on one journal break it) and
+#    the cycle links that chain's head as a journal.linked event.
 ../ENRG-AI/.venv/bin/python -m monster.data tape --root var/tape --store var/data
 ../ENRG-AI/.venv/bin/python -m monster.data capture --fixtures var/tape --store var/data \
-  --count 130 --interval 300 --at 1794873600
+  --count 130 --interval 300 --at 1794873600 --journal var/journal.capture.jsonl
 ../ENRG-AI/.venv/bin/python -m monster.data audit --store var/data
-../ENRG-AI/.venv/bin/python -m monster.cycle --store var/data --interval 300 \
+MONSTER_DATA_JOURNAL=var/journal.capture.jsonl \
+  ../ENRG-AI/.venv/bin/python -m monster.cycle --store var/data --interval 300 \
   --journal var/journal.jsonl --state var/state.json
 
 ../ENRG-AI/.venv/bin/python -m monster.cycle --verify
+# ok (27 events) + links: 1 ok — the second line re-reads the capture chain's
+# recorded head, so an edit to the data chain after the decision is named too.
+../ENRG-AI/.venv/bin/python -m monster.cycle --replay   # is the cache still the journal's book?
 ```
 
 On the VPS the same code runs against the venues: `probe --live` first, then
 `capture --live --store var/data --interval 60 --count 10080 --journal
-var/journal.jsonl --fsync` for a week.  The operator runbook — checks, tmux and
-systemd units, daily `audit`, what to send back — is [`docs/VPS.md`](docs/VPS.md).
+var/journal.capture.jsonl --fsync` for a week.  The operator runbook — checks,
+tmux and systemd units, daily `audit`, what to send back — is
+[`docs/VPS.md`](docs/VPS.md).
 
 The example fixture is invented data.  It exists to make the arithmetic
 auditable offline, and the snapshot run prints something like:
@@ -105,7 +113,10 @@ reason to trust it later.
 
 Run the same cycle twice and the second refuses with `ALREADY_OPEN`: a carry is
 a position, not a subscription, and the horizon decides when it ends.  The
-journal records both cycles and `--verify` walks the 25-line chain.
+journal records both cycles and `--verify` walks the 27-line chain — fifteen
+lines for the cycle that traded (two fills, one `position.opened`) and twelve for
+the one that refused — including the `journal.linked` line that ties the capture
+chain to the book.
 
 Note what the runs say honestly: in the frozen snapshot the perp symbols are
 quoted by one venue, so their cross-venue truth is **unmeasured** — "I could not
@@ -129,6 +140,12 @@ They are vetoes, not preferences: an old quote is not a price, and an old
 funding rate is `unmeasured` rather than zero.  The trading venue must be in
 `MONSTER_TRUTH_VENUES` — a venue you trade must be a venue you check.
 
+Two more are about integrity rather than arithmetic: `MONSTER_DATA_JOURNAL`
+names the collector's chain, so each cycle can link it by hash (unset means "no
+capture chain"), and `MONSTER_MAX_SNAPSHOT_AGE_S` (default 180, three capture
+intervals) is how old the freshest pass may be before a cycle refuses to call it
+"now".  One shared journal for two writers is refused outright at startup.
+
 ```bash
 MONSTER_CAPITAL_USD=1000 MONSTER_NOTIONAL_USD=100 MONSTER_MIN_EDGE_BPS=10 \
 MONSTER_HORIZON_HOURS=168 MONSTER_FEE_BPS=5 MONSTER_SLIPPAGE_BPS=2 \
@@ -139,20 +156,44 @@ MONSTER_HORIZON_HOURS=168 MONSTER_FEE_BPS=5 MONSTER_SLIPPAGE_BPS=2 \
 
 One JSON object per line, in this order for a cycle:
 
-`data.derived` (when `--store` supplied the snapshot) → `cycle.started` →
-`funding.accrued` → `day.rolled` → `equity.mark` → `truth.read` →
-`coherence.read` → `carry.scan` → `intent.proposed` → `order.filled` /
-`intent.refused` → `position.opened` → `trade.closed` → `autopsy.summary` →
-`cycle.finished`
+`data.derived` (when `--store` supplied the snapshot) → `journal.linked` (when a
+capture chain exists) → `cycle.started` → `funding.accrued` → `day.rolled` →
+`equity.mark` → `truth.read` → `coherence.read` → `carry.scan` →
+`intent.proposed` → `order.filled` / `intent.refused` → `position.opened` →
+`trade.closed` → `autopsy.summary` → `cycle.finished`
 
 `data.derived` is the provenance line: how many quotes and funding rates the
 snapshot held, which symbols entered the history, how many bars each one had,
 which gaps and coverage numbers the store reported.  A decision can then be
 read together with the data it saw, not just the price it used.
 
-`data.captured` is written by `python -m monster.data capture --journal ...`
-for every pass, including the endpoints that failed and why.  A feed that
-breaks leaves a line, the same way a limit that fires does.
+`data.captured` belongs to the collector's **own** chain, `var/journal.capture.jsonl`:
+every pass, including the endpoints that failed and why.  A feed that breaks
+leaves a line, the same way a limit that fires does.  Two writers on one journal
+interleave `prev`/`hash` and break it, so the split is a rule rather than a
+convention — and `Journal.append` refuses a file that grew behind its back,
+which turns a silent fork into an error the same minute.  `journal.linked` is
+what keeps the split honest: each cycle records the capture chain's head, and
+`--verify` re-reads every recorded head so a capture file edited afterwards no
+longer matches what the book says it saw.  `deploy/monster-book.{service,timer}`
+runs that check plus `--replay` every hour: a red unit is the alert, and there is
+no `SuccessExitStatus=` to soften it.
+
+The state cache is checked, not trusted: `--replay` rebuilds the book from the
+journal and compares it field by field with `var/state.json`.  A cycle does the
+same before deciding anything:
+
+* they agree — trade, nothing is written;
+* the cache is gone — it is refilled from the chain and `state.rebuilt` says so;
+* they disagree — the cycle refuses (exit 2) and writes `state.diverged` with
+  every field that differs, naming both numbers.  It does not average the two
+  books and does not pick the convenient one: a phantom position is a
+  disagreement nobody asked about.  `--replay --write-state` adopts the
+  journal's book once a human has looked.
+
+A `--store` cycle that means "as of now" also refuses a capture pass older than
+`MONSTER_MAX_SNAPSHOT_AGE_S` and writes `cycle.stale`: a decision on a collector
+that stopped an hour ago is a decision about the past.
 
 Every refusal carries a machine code (`GROSS`, `NET_DELTA`, `SYMBOL`, `VENUE`,
 `LEVERAGE`, `NO_CASH`, `DAILY_LOSS`, `KILLED`, `TRUTH_FLAG`, `ALREADY_OPEN`,
@@ -160,7 +201,15 @@ Every refusal carries a machine code (`GROSS`, `NET_DELTA`, `SYMBOL`, `VENUE`,
 read: a limit that fires is evidence about the limits.
 
 `--verify` walks the chain and names the first line that does not belong; the
-cycle refuses to trade when the past has been edited.
+cycle refuses to trade when the past has been edited.  It also checks the chains
+this one *links*: a `journal.linked` event is a claim that "when this cycle ran,
+the capture chain had N lines and line N hashed to H", and `--verify` opens that
+file, verifies it as a chain, and compares the recorded line — `ok`, `edited`
+(rewritten), `truncated` (cut short), `missing` (deleted), `broken` (the linked
+chain does not verify) or `unlinked` (the cycle recorded that it could not read
+it).  Growth after the link is normal and is not a mismatch: the claim
+is about a moment, not about the tail.  `--no-links` checks one chain only, for
+the operator who archived the other file on purpose.
 
 ## What this version does not do
 
@@ -183,6 +232,7 @@ monster/
   monster/
     contracts.py   the wire: Quote, FundingQuote, Snapshot, Leg, Intent, Fill, ClosedTrade
     journal.py     append-only hash chain: Event, Journal, verify()
+    replay.py      the journal rebuilt into a book; the cache compared with it
     enrg.py        the one bridge to ENRG-AI (oscillator, resolution gate)
     instruments.py one canonical name per instrument, and each venue's native id
     brain/phase.py Kuramoto order parameter + circular-shift surrogate null
@@ -205,8 +255,9 @@ monster/
       synthetic.py a synthetic tape, labelled as such
   data/raw-fixtures/  venue-shaped bodies for offline parser/capture tests
   data/snapshots/     invented fixtures for the 0.1.0 frozen-snapshot run
-  deploy/             systemd units for the capture week (see docs/VPS.md)
+  deploy/             systemd units for the capture week (see docs/VPS.md);
+                      monster-book.{service,timer} is the hourly verify+replay audit
   docs/VPS.md         the operator runbook: install, probe, run, check, report
-  tests/              167 tests: every refusal has one
+  tests/              194 tests: every refusal has one
   docs/MONSTER.md     charter, roadmap, integration plan, non-negotiables
 ```

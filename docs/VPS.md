@@ -16,7 +16,8 @@
 | покрытие | `python -m monster.data gaps --store var/data --interval 60` | ≥ 98 % слотов у каждого `(биржа, символ)` |
 | воспроизводимость | `python -m monster.data audit --store var/data --day <день>` | 100 % ключей: raw → normalized |
 | сбор идёт | `tail var/log/capture.log` | строка в минуту, `18 reading(s), 18 raw body(ies)` |
-| журнал цел | `python -m monster.cycle --verify` | `ok (N events)` |
+| журнал цел | `python -m monster.cycle --verify` | `ok (N events)` и `links: k ok` |
+
 
 Если покрытие ниже — это не «почти получилось»: это другой набор данных, и он
 будет назван, а не подтянут интерполяцией.
@@ -116,10 +117,16 @@ tmux new -s monster
 # внутри tmux:
 env PYTHONUNBUFFERED=1 .venv/bin/python -m monster.data capture \
   --live --store var/data --interval 60 --count 10080 \
-  --journal var/journal.jsonl --fsync \
+  --journal var/journal.capture.jsonl --fsync \
   2>&1 | tee -a var/log/capture.log
 # отцепиться, оставив работать: Ctrl-b, затем d
 ```
+
+> `--journal` у сборщика — **свой** файл (`var/journal.capture.jsonl`). Два
+> писателя на один журнал перемежают `prev`/`hash` и ломают цепочку, поэтому
+> `append` отказывает файлу, который вырос за спиной. Цикл пишет
+> `var/journal.jsonl` и связывает цепочку сборщика головой (`journal.linked`):
+> `MONSTER_DATA_JOURNAL=var/journal.capture.jsonl`.
 
 `10080` = 7 суток × 24 ч × 60 мин — процесс сам завершится через неделю.
 Повторный запуск позже не испортит данные: дубликаты `(venue, symbol, ts)`
@@ -182,6 +189,61 @@ tail -5 var/log/probe.log
 неделя ничего не стоит. Час — это цена раннего предупреждения; раз в неделю —
 цена того, что узнаёшь на восьмой день.
 
+Плюс часовой аудит книги — `--verify` и `--replay` одной единицей:
+
+```bash
+sudo sed "s#<USER>#$USER#g; s#<HOME>#$HOME#g" deploy/monster-book.service \
+  | sudo tee /etc/systemd/system/monster-book.service
+sudo sed "s#<USER>#$USER#g; s#<HOME>#$HOME#g" deploy/monster-book.timer \
+  | sudo tee /etc/systemd/system/monster-book.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now monster-book.timer
+systemctl list-timers monster-book --no-pager
+cat var/log/book.log
+```
+
+Он спрашивает два вопроса каждую минуту `:07`:
+
+1. **Целы ли цепочки** — своя и те, на которые книга ссылается.
+   `journal.linked` — утверждение «когда цикл решал, у сборщика было N строк и
+   строка N хешировалась в H». Утверждение, которое никто не проверяет, — это
+   комментарий, поэтому `--verify` идёт по каждой ссылке и говорит `ok`,
+   `edited` (цепочку переписали), `missing` (удалили), `truncated` (обрезали) или
+   `broken` (цепочка сама себя не подтверждает). Только `ok` и `unlinked`
+   (`цикл сам записал, что не смог прочитать`) считаются нормой.
+2. **Совпадает ли кэш с книгой** — `--replay` пересобирает книгу из цепочки той
+   же арифметикой, что и торговля, и сравнивает с `var/state.json` поле за полем.
+
+Ненулевой код выхода — и есть сигнализация: `systemctl --failed` показывает
+`monster-book.service`, а в `var/log/book.log` лежит строка, где названы оба
+числа, которые разошлись. `SuccessExitStatus=` здесь нет намеренно: «почти
+сходится» — это не «сходится». Строка `reconcile: rebuilt` в логе — не ошибка, а
+пропавший кэш: следующий цикл восстановит его из цепочки.
+
+### Первый цикл, который связывает цепочки
+
+Сборщик пишет свою цепочку, книга — свою, и связывает их только цикл: без
+`MONSTER_DATA_JOURNAL` он не знает, что рядом есть вторая цепочка, и `--verify`
+нечего проверять.
+
+```bash
+cd "$HOME/entrain-core-workspace/monster"
+export MONSTER_DATA_JOURNAL=var/journal.capture.jsonl
+.venv/bin/python -m monster.cycle --store var/data --interval 60 \
+  --journal var/journal.jsonl --state var/state.json
+.venv/bin/python -m monster.cycle --verify       # ok (N events), links: k ok
+.venv/bin/python -m monster.cycle --replay       # reconcile: ok
+```
+
+> **Когда появится первая ссылка.** `journal.linked` пишется перед решением,
+> после `data.derived`, поэтому на молодом магазине цикл откажет раньше:
+> `data: history: 43 of 128 bars fit before ...`. Это отказ молодого магазина,
+> а не поломка — когерентность читается по 128 закрытым минутам, то есть первая
+> ссылка появляется примерно через два часа после старта сборщика. До тех пор
+> `--verify` печатает только строку цепочки без `links:` — это честный ответ
+> «связывать пока нечего», а не пропущенная проверка.
+
+
 
 ## 5. Ежедневная проверка (2 минуты)
 
@@ -201,6 +263,10 @@ du -sh var/data && ls var/data | tail -3
 # 4. сработала ли truth-проверка там, где надо (FP-ворота Фазы 1)
 .venv/bin/python -m monster.data truth-report --store var/data \
   --day "$(date -u -d yesterday +%F)"
+
+# 5. книга сходится: цепочки целы, кэш — та же книга
+.venv/bin/python -m monster.cycle --verify && .venv/bin/python -m monster.cycle --replay
+systemctl --failed --no-pager       # пусто — значит ничего не сломано
 ```
 
 Cron (UTC, каждую ночь — по вчерашнему закрытому дню):
@@ -288,6 +354,11 @@ git pull                                         # или rsync заново
 | `BadGzipFile` при `audit` | читается сегодняшний, ещё открытый файл | аудитить вчерашний день |
 | `17 reading(s)` каждый раз | один эндпоинт отказал | в строке будет имя и причина — это и есть ценность |
 | `System clock synchronized: no` | часы уплыли | §1, и только потом продолжать |
+| `links: 1 of 1 do not hold` в `--verify` | цепочку переписали после того, как книга её прочитала | не «чинить» книгу: строка `edited`/`missing` называет файл; без бэкапа неделя под вопросом |
+| `reconcile: diverged` в `--replay` | кэш `var/state.json` и цепочка описывают разные книги | цикл сам откажет (код 2); кэш удаляем — он восстановится из цепочки (`--replay --write-state`) |
+| `reconcile: rebuilt` в логе `book.log` | кэш пропал (не расхождение) | ничего не делать: следующий цикл пересоберёт его из цепочки |
+| `history: N of 128 bars fit` | магазин моложе окна когерентности | не ошибка; решение появится, когда наберётся 128 закрытых минут |
+| `the freshest capture pass is N s old` | сборщик отстал сильнее `MONSTER_MAX_SNAPSHOT_AGE_S` | `systemctl status monster-capture`; решение на старых данных — это решение о прошлом |
 
 Важно: **одна отказавшая биржа не останавливает сбор**. В логе будет
 `17 reading(s)` и имя отказавшего эндпоинта; остальные 17 пишутся. Это
@@ -303,15 +374,20 @@ for d in $(ls var/data); do
   .venv/bin/python -m monster.data audit --store var/data --day "$d" >> var/audit.txt
 done
 .venv/bin/python -m monster.cycle --verify > var/journal.txt
+.venv/bin/python -m monster.cycle --verify --journal var/journal.capture.jsonl >> var/journal.txt
+.venv/bin/python -m monster.cycle --replay >> var/journal.txt
 du -sh var/data >> var/journal.txt
+cp var/log/book.log var/book.txt 2>/dev/null || true
 for d in $(ls var/data); do
   .venv/bin/python -m monster.data truth-report --store var/data --day "$d" --json >> var/truth.jsonl
 done
 ```
 
-Пять файлов — `probe.txt`, `gaps.txt`, `audit.txt`, `journal.txt`,
-`truth.jsonl` — и есть ответ на вопрос «прошла ли Фаза 1 свои ворота». Ничего
-не надо пересказывать словами: числа либо сходятся, либо нет.
+Эти файлы — `probe.txt`, `gaps.txt`, `audit.txt`, `journal.txt`, `truth.jsonl`
+и `book.txt` (ежечасный аудит книги: `ok`, `links: k ok`, `reconcile: ok` или
+строка с обоими разошедшимися числами) — и есть ответ на вопрос «прошла ли Фаза
+1 свои ворота». Ничего не надо пересказывать словами: числа либо сходятся, либо
+нет.
 
 ## 10. Чего не делать
 
@@ -324,6 +400,8 @@ done
   строками, и любое новое поле превращает честный день в `mismatched`;
 * не «поправлять» файлы в `var/data` руками: `audit` поймает, а доверие к
   неделе обнулится;
-* не удалять `var/journal.jsonl` — это единственная защита от тихой правки
-  истории (проверяется `monster.cycle --verify`).
+* не удалять `var/journal.jsonl` и `var/journal.capture.jsonl` — это
+  единственная защита от тихой правки истории (проверяется `monster.cycle
+  --verify`); `--replay` показывает, что книга в кэше — та же книга, что в
+  цепочке, и расхождение цикла — это отказ, а не повод «подправить» кэш.
 
