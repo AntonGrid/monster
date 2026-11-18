@@ -36,7 +36,7 @@ neither, so they run on a machine that only has this repository.
 
 ```bash
 cd monster
-../ENRG-AI/.venv/bin/python -m pytest          # 194 tests, no network
+../ENRG-AI/.venv/bin/python -m pytest          # 199 tests, no network
 
 # 0. One question per endpoint: does the venue answer the shape we parse, or
 #    merely answer?  It writes nothing, so it is safe to run first.
@@ -165,7 +165,10 @@ capture chain exists) → `cycle.started` → `funding.accrued` → `day.rolled`
 `data.derived` is the provenance line: how many quotes and funding rates the
 snapshot held, which symbols entered the history, how many bars each one had,
 which gaps and coverage numbers the store reported.  A decision can then be
-read together with the data it saw, not just the price it used.
+read together with the data it saw, not just the price it used.  A `--store`
+cycle on a store younger than the coherence window stops right after it, with
+`cycle.not_ready`; a store whose newest pass is too old stops before it, with
+`cycle.stale`.
 
 `data.captured` belongs to the collector's **own** chain, `var/journal.capture.jsonl`:
 every pass, including the endpoints that failed and why.  A feed that breaks
@@ -192,8 +195,19 @@ same before deciding anything:
   journal's book once a human has looked.
 
 A `--store` cycle that means "as of now" also refuses a capture pass older than
-`MONSTER_MAX_SNAPSHOT_AGE_S` and writes `cycle.stale`: a decision on a collector
-that stopped an hour ago is a decision about the past.
+`MONSTER_MAX_SNAPSHOT_AGE_S` and writes `cycle.stale` (exit `4`): a decision on a
+collector that stopped an hour ago is a decision about the past.  A store that
+cannot fill the coherence window is refused before anything is decided —
+`cycle.not_ready`, exit `3` — because the reading would be unmeasured and the
+beast would trade on carry alone.
+
+One exit code per fact, so an hourly timer can tell "wait" from "wake a human":
+`0` a cycle ran, `1` the beast says no (kill switch tripped, chain does not
+verify), `2` the accounts disagree or the store cannot be read, `3` too little
+history yet, `4` the collector is behind, `64` the command itself was wrong.
+`deploy/monster-cycle.{service,timer}` runs the cycle at `:37` and softens
+exactly one of them, `SuccessExitStatus=3`: waiting for a store to grow is a
+calendar, not a fault.  Codes `1`, `2` and `4` still turn the unit red.
 
 Every refusal carries a machine code (`GROSS`, `NET_DELTA`, `SYMBOL`, `VENUE`,
 `LEVERAGE`, `NO_CASH`, `DAILY_LOSS`, `KILLED`, `TRUTH_FLAG`, `ALREADY_OPEN`,
@@ -256,8 +270,9 @@ monster/
   data/raw-fixtures/  venue-shaped bodies for offline parser/capture tests
   data/snapshots/     invented fixtures for the 0.1.0 frozen-snapshot run
   deploy/             systemd units for the capture week (see docs/VPS.md);
-                      monster-book.{service,timer} is the hourly verify+replay audit
+                      monster-book.{service,timer} is the hourly verify+replay audit,
+                      monster-cycle.{service,timer} the hourly cycle (green only on 3)
   docs/VPS.md         the operator runbook: install, probe, run, check, report
-  tests/              194 tests: every refusal has one
+  tests/              199 tests: every refusal has one
   docs/MONSTER.md     charter, roadmap, integration plan, non-negotiables
 ```

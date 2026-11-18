@@ -62,7 +62,37 @@ from monster.replay import reconcile
 from monster.risk.limits import KillSwitch, check
 from monster.strategies.carry import CarryScan, scan_carry
 
-__all__ = ["Decision", "CycleReport", "run_cycle", "load_state", "save_state", "main"]
+__all__ = [
+    "Decision",
+    "CycleReport",
+    "run_cycle",
+    "load_state",
+    "save_state",
+    "main",
+    "EXIT_OK",
+    "EXIT_REFUSED",
+    "EXIT_DIVERGED",
+    "EXIT_NOT_READY",
+    "EXIT_STALE",
+    "EXIT_USAGE",
+]
+
+#: What an exit code means.  The cycle runs unattended, so this number is the only
+#: sentence a timer can read — and a number that means three things teaches the
+#: operator to ignore all three.  Exactly one code says "wait":
+#:
+#: ``0`` a cycle ran: it traded, or it declined and said why;
+#: ``1`` the beast says no: the kill switch is tripped, or the chain does not verify;
+#: ``2`` the accounts disagree, or the store cannot be read — a human must look;
+#: ``3`` too little history yet: the store is younger than the coherence window;
+#: ``4`` the freshest capture pass is older than the limit — the collector is behind;
+#: ``64`` the command itself was wrong; nothing was attempted.
+EXIT_OK = 0
+EXIT_REFUSED = 1
+EXIT_DIVERGED = 2
+EXIT_NOT_READY = 3
+EXIT_STALE = 4
+EXIT_USAGE = 64
 
 
 @dataclass(frozen=True)
@@ -484,25 +514,33 @@ def _replay_command(
     verdict = journal.verify()
     if verdict != "ok":
         print(f"{journal_path}: {verdict} — the journal cannot be replayed", file=sys.stderr)
-        return 1
+        return EXIT_REFUSED
     cached = load_state(state_path, config)[0] if state_path.exists() else None
     outcome = reconcile(journal, config, cached)
     print(outcome.describe())
     if not args.write_state:
-        return 1 if outcome.diverged else 0
+        return EXIT_DIVERGED if outcome.diverged else EXIT_OK
     if outcome.diverged:
         print(
             "refusing to overwrite the cache: the two accounts disagree and this command cannot "
             "prove which is right — move the cache aside to adopt the journal's book",
             file=sys.stderr,
         )
-        return 1
+        return EXIT_DIVERGED
     kill = load_state(state_path, config)[1] if state_path.exists() else KillSwitch()
     save_state(state_path, outcome.book, kill)
     if outcome.mode != "ok":
         journal.append("state.rebuilt", outcome.to_dict())
     print(f"{state_path}: written from the journal ({outcome.events} events)")
-    return 0
+    return EXIT_OK
+
+
+def _first_history_note(notes: Sequence[str]) -> str:
+    """The derivation's own sentence about how far the store reaches, if it has one."""
+    for note in notes:
+        if note.startswith("history:"):
+            return f" ({note})"
+    return ""
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -552,15 +590,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         journal = Journal(journal_path)
     except JournalError as error:
         print(f"journal: {error}", file=sys.stderr)
-        return 2
+        return EXIT_REFUSED
 
     if args.verify:
         verdict = journal.verify()
         print(f"{journal_path}: {verdict} ({journal.count()} events)")
         if verdict != "ok":
-            return 1
+            return EXIT_REFUSED
         if args.no_links:
-            return 0
+            return EXIT_OK
         # The chain proves this file was not edited.  The links prove the *other*
         # files were not edited after this one read them: a cycle that recorded
         # "the capture chain had 130 lines, head 4f1a..." is making a claim, and
@@ -575,17 +613,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "changed after it read from it; the past this book describes is not the past on disk",
                 file=sys.stderr,
             )
-            return 1
+            return EXIT_REFUSED
         if links:
             print(f"links: {len(links)} ok")
-        return 0
+        return EXIT_OK
 
     if args.replay:
         return _replay_command(args, journal, journal_path, state_path, config)
 
     if args.write_state:
         print("--write-state only makes sense with --replay", file=sys.stderr)
-        return 2
+        return EXIT_USAGE
 
     venue, kill = load_state(state_path, config)
     if args.reset_kill:
@@ -593,13 +631,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         save_state(state_path, venue, kill)
         journal.append("kill.reset", {"operator": args.reset_kill})
         print(f"kill switch: {kill.reason}")
-        return 0
+        return EXIT_OK
 
     if not args.snapshot and not args.store:
         print(f"mode={config.mode} venue={config.venue} capital={config.capital_usd:.2f} USD")
         print(f"journal={journal_path} ({journal.count()} events, {journal.verify()})")
         print("nothing to do: pass --snapshot or --store to run a cycle", file=sys.stderr)
-        return 2
+        return EXIT_USAGE
 
     # The cache is a convenience; the chain is the book.  A cache that disagrees
     # is refused rather than averaged, and a cache that has gone missing is
@@ -614,7 +652,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "Move the cache aside to trade the journal's book, or investigate the divergence.",
             file=sys.stderr,
         )
-        return 2
+        return EXIT_DIVERGED
     if outcome.mode == "rebuilt":
         journal.append("state.rebuilt", outcome.to_dict())
         save_state(state_path, outcome.book, kill)
@@ -625,7 +663,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.store:
         if args.snapshot or args.history:
             print("--store derives the snapshot and history itself; do not pass --snapshot/--history", file=sys.stderr)
-            return 2
+            return EXIT_USAGE
         from monster.data.derive import DataError, derive
         from monster.data.store import Store, StoreError
 
@@ -639,8 +677,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 funding_max_age_h=config.funding_max_age_h,
             )
         except (DataError, StoreError) as error:
+            # The store's own reason decides the code: "not yet" and "the file is
+            # unreadable" are the same sentence to a human and different sentences
+            # to a timer, and only one of them should be allowed to stay quiet.
+            code = getattr(error, "code", "bad-data")
             print(f"data: {error}", file=sys.stderr)
-            return 2
+            if code == "not-ready":
+                return EXIT_NOT_READY
+            if code == "stale":
+                return EXIT_STALE
+            return EXIT_DIVERGED
         snapshot = derivation.snapshot
         history = derivation.history
         data_notes = derivation.notes
@@ -663,12 +709,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "the collector is behind, and a decision on this data would be about the past",
                     file=sys.stderr,
                 )
-                return 2
+                return EXIT_STALE
             data_notes = tuple(data_notes) + (f"capture pass age at decision time: {age:.1f}s",)
         # The provenance is written before the decision, and only into a journal
         # that still verifies: a broken past gets no new lines from this process.
         if journal.verify() == "ok":
             journal.append("data.derived", derivation.to_dict(), ts=snapshot.ts)
+        # A store that cannot fill the coherence window is not a store to trade on:
+        # the physics reading would be unmeasured, the report would say so only in a
+        # note, and the beast would trade on carry alone.  This is the normal shape
+        # of the first two hours after a collector starts, so it gets its own exit
+        # code — the one code a timer is allowed to treat as "wait".
+        window = int(config.coherence_window)
+        available = min((len(series) for series in history.values()), default=0)
+        requested = args.bars or window
+        if available < window:
+            if journal.verify() == "ok":
+                journal.append(
+                    "cycle.not_ready",
+                    {
+                        "bars": available,
+                        "window": window,
+                        "bars_requested": int(requested),
+                        "interval_s": args.interval or float(config.interval_s),
+                        "at": snapshot.ts,
+                        "notes": list(data_notes),
+                    },
+                    ts=snapshot.ts,
+                )
+            print(
+                f"data: the store holds {available} aligned bar(s) of the {window} the coherence "
+                f"window needs{_first_history_note(data_notes)}; a young store is waited for, "
+                "not traded on",
+                file=sys.stderr,
+            )
+            return EXIT_NOT_READY
     else:
         snapshot = Snapshot.from_dict(
             json.loads(Path(str(args.snapshot)).expanduser().read_text(encoding="utf-8"))
@@ -687,10 +762,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     except JournalError as error:
         print(f"journal: {error}", file=sys.stderr)
-        return 2
+        return EXIT_REFUSED
     save_state(state_path, venue, kill)
     print(json.dumps(report.to_dict(), indent=2, sort_keys=True) if args.json else report.describe())
-    return 0 if not report.killed else 1
+    return EXIT_OK if not report.killed else EXIT_REFUSED
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised through ``python -m``

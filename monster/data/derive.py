@@ -42,7 +42,19 @@ __all__ = ["DataError", "Derivation", "snapshot_from", "history_window", "derive
 
 
 class DataError(RuntimeError):
-    """The store cannot produce a decision-grade snapshot, and says why."""
+    """The store cannot produce a decision-grade snapshot, and says why.
+
+    ``code`` is ``"not-ready"`` when the store is younger than the question (a
+    collector that has just started, or a directory with no quotes yet),
+    ``"stale"`` when the newest reading is too old to be "now", and ``"bad-data"``
+    when the file cannot be read at all.  The cycle turns the first two into
+    distinct exit codes, because "wait" and "wake a human" are different
+    instructions and a single code for both is a single code nobody trusts.
+    """
+
+    def __init__(self, message: str, *, code: str = "bad-data") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -142,7 +154,8 @@ def snapshot_from(
     if not fresh:
         raise DataError(
             f"no quote at or before {at:.0f} is younger than {quote_max_age_s:.1f}s; "
-            "the capture stopped, or the clock moved, and the cycle has nothing to trade on"
+            "the capture stopped, or the clock moved, and the cycle has nothing to trade on",
+            code="stale",
         )
 
     snapshot = Snapshot(ts=at, quotes=tuple(fresh), funding=tuple(funding), source=source)
@@ -237,7 +250,10 @@ def derive(
     if at is None:
         at = store.latest("quote")
         if at is None:
-            raise DataError(f"{store.root}: the store holds no quotes; run a capture before a cycle")
+            raise DataError(
+                f"{store.root}: the store holds no quotes; run a capture before a cycle",
+                code="not-ready",
+            )
     at = float(at)
     window = max(bars * float(interval_s), funding_max_age_h * 3600.0, quote_max_age_s) + float(interval_s)
     quote_batch = store.read_quotes(since=at - window, until=at)

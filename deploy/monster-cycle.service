@@ -1,0 +1,26 @@
+[Unit]
+Description=ENRG Monster hourly paper cycle — one decision over the frozen capture store
+Documentation=file://<INSTALL_DIR>/docs/VPS.md
+After=monster-capture.service
+Wants=monster-capture.service
+
+[Service]
+Type=oneshot
+User=<USER>
+WorkingDirectory=<INSTALL_DIR>
+Environment=PYTHONUNBUFFERED=1
+# The collector keeps writing while the cycle runs, which is exactly why the two
+# chains are two files: the cycle links the capture head before it decides.
+Environment=MONSTER_DATA_JOURNAL=var/journal.capture.jsonl
+ExecStartPre=/bin/mkdir -p <INSTALL_DIR>/var/log
+# ``3`` has one meaning — the store is younger than the coherence window, so
+# there is nothing to decide yet.  That is the expected answer for the first two
+# hours of a week and after any restart, and it must not page anyone: the timer
+# treats exactly this code as green.  Everything else stays red, because a
+# divergence (2), a stale collector (4), a tripped kill switch (1) or a store that
+# cannot be read (2) is a fact a human has to see.
+ExecStart=<INSTALL_DIR>/.venv/bin/python -m monster.cycle --store var/data --interval 60
+SuccessExitStatus=3
+Nice=5
+StandardOutput=append:<INSTALL_DIR>/var/log/cycle.log
+StandardError=append:<INSTALL_DIR>/var/log/cycle.log

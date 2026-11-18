@@ -1,0 +1,10 @@
+[Unit]
+Description=ENRG Monster cycle, hourly at :37 (one decision over the capture store)
+
+[Timer]
+OnCalendar=*-*-* *:37:00 UTC
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

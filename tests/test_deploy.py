@@ -25,3 +25,33 @@ def test_the_book_audit_verifies_first_and_never_softens_a_failure():
     assert not any(line.startswith("SuccessExitStatus") for line in directives)
     timer = (DEPLOY / "monster-book.timer").read_text(encoding="utf-8")
     assert "OnCalendar=" in timer and "WantedBy=timers.target" in timer
+
+
+def test_the_cycle_timer_treats_a_young_store_as_waiting_not_as_failure():
+    """Exactly one code may stay green: the one that says "not yet"."""
+    service = (DEPLOY / "monster-cycle.service").read_text(encoding="utf-8")
+    softened = [
+        line.strip()
+        for line in service.splitlines()
+        if line.strip().startswith("SuccessExitStatus")
+    ]
+    assert softened == ["SuccessExitStatus=3"], (
+        "3 is 'the store is younger than the coherence window'; a divergence (2), a stale "
+        "collector (4) or a tripped kill switch (1) must still turn the unit red"
+    )
+    # The cycle must link the collector's chain, or the book audit has nothing to check.
+    assert "MONSTER_DATA_JOURNAL=var/journal.capture.jsonl" in service
+    assert "--store var/data" in service
+    timer = (DEPLOY / "monster-cycle.timer").read_text(encoding="utf-8")
+    assert "OnCalendar=" in timer and "WantedBy=timers.target" in timer
+
+
+def test_the_units_name_one_directory_and_the_operator_fills_it_in():
+    """One placeholder, not a hard-coded checkout path: `sed` is the install step."""
+    for unit in sorted(DEPLOY.glob("monster-*")):
+        text = unit.read_text(encoding="utf-8")
+        assert "entrain-core-workspace" not in text, f"{unit.name} hard-codes a checkout path"
+        assert "<HOME>" not in text, f"{unit.name} uses a placeholder with no directory in it"
+    service = (DEPLOY / "monster-cycle.service").read_text(encoding="utf-8")
+    assert "WorkingDirectory=<INSTALL_DIR>" in service
+    assert "User=<USER>" in service

@@ -147,9 +147,17 @@ tmux attach -t monster          # посмотреть; выйти — Ctrl-b d
 
 ### Вариант без tmux: systemd (переживает reboot)
 
+> **Сначала — пути.** В шаблонах `deploy/*` нет ни одного абсолютного пути: есть
+> ровно два заполнителя, `<USER>` и `<INSTALL_DIR>`. Если ваш checkout лежит не в
+> `~/entrain-core-workspace/monster` (например, `/root/monster`), подставьте свой
+> путь через `INSTALL_DIR` — иначе юнит запустит несуществующий python или, хуже,
+> чужой каталог. Что реально попало в юнит, видно в `systemctl cat monster-cycle`.
+
 ```bash
-sudo sed "s#<USER>#$USER#g; s#<HOME>#$HOME#g" \
-  deploy/monster-capture.service | sudo tee /etc/systemd/system/monster-capture.service
+cd "$HOME/entrain-core-workspace/monster"
+INSTALL_DIR="$PWD"           # ← путь к checkout; на этом VPS это /root/monster
+sed "s#<USER>#$USER#g; s#<INSTALL_DIR>#$INSTALL_DIR#g" deploy/monster-capture.service \
+  | sudo tee /etc/systemd/system/monster-capture.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now monster-capture
 systemctl status monster-capture --no-pager
@@ -162,9 +170,10 @@ journalctl -u monster-capture -n 20 --no-pager
 Плюс ежедневный `audit` таймером (00:10 UTC, по вчерашнему дню):
 
 ```bash
-sudo sed "s#<USER>#$USER#g; s#<HOME>#$HOME#g" deploy/monster-audit.service \
+INSTALL_DIR="$PWD"
+sudo sed "s#<USER>#$USER#g; s#<INSTALL_DIR>#$INSTALL_DIR#g" deploy/monster-audit.service \
   | sudo tee /etc/systemd/system/monster-audit.service
-sudo sed "s#<USER>#$USER#g; s#<HOME>#$HOME#g" deploy/monster-audit.timer \
+sudo sed "s#<USER>#$USER#g; s#<INSTALL_DIR>#$INSTALL_DIR#g" deploy/monster-audit.timer \
   | sudo tee /etc/systemd/system/monster-audit.timer
 sudo systemctl daemon-reload
 sudo systemctl enable --now monster-audit.timer
@@ -174,9 +183,10 @@ systemctl list-timers monster-audit --no-pager
 Плюс часовой `probe` — сторож формы ответов, а не данных:
 
 ```bash
-sudo sed "s#<USER>#$USER#g; s#<HOME>#$HOME#g" deploy/monster-probe.service \
+INSTALL_DIR="$PWD"
+sudo sed "s#<USER>#$USER#g; s#<INSTALL_DIR>#$INSTALL_DIR#g" deploy/monster-probe.service \
   | sudo tee /etc/systemd/system/monster-probe.service
-sudo sed "s#<USER>#$USER#g; s#<HOME>#$HOME#g" deploy/monster-probe.timer \
+sudo sed "s#<USER>#$USER#g; s#<INSTALL_DIR>#$INSTALL_DIR#g" deploy/monster-probe.timer \
   | sudo tee /etc/systemd/system/monster-probe.timer
 sudo systemctl daemon-reload
 sudo systemctl enable --now monster-probe.timer
@@ -192,9 +202,10 @@ tail -5 var/log/probe.log
 Плюс часовой аудит книги — `--verify` и `--replay` одной единицей:
 
 ```bash
-sudo sed "s#<USER>#$USER#g; s#<HOME>#$HOME#g" deploy/monster-book.service \
+INSTALL_DIR="$PWD"
+sudo sed "s#<USER>#$USER#g; s#<INSTALL_DIR>#$INSTALL_DIR#g" deploy/monster-book.service \
   | sudo tee /etc/systemd/system/monster-book.service
-sudo sed "s#<USER>#$USER#g; s#<HOME>#$HOME#g" deploy/monster-book.timer \
+sudo sed "s#<USER>#$USER#g; s#<INSTALL_DIR>#$INSTALL_DIR#g" deploy/monster-book.timer \
   | sudo tee /etc/systemd/system/monster-book.timer
 sudo systemctl daemon-reload
 sudo systemctl enable --now monster-book.timer
@@ -220,11 +231,44 @@ cat var/log/book.log
 сходится» — это не «сходится». Строка `reconcile: rebuilt` в логе — не ошибка, а
 пропавший кэш: следующий цикл восстановит его из цепочки.
 
+Плюс сам цикл — раз в час, `:37` (аудит книги — `:07`, чтобы два процесса не
+писали в один момент):
+
+```bash
+INSTALL_DIR="$PWD"
+sudo sed "s#<USER>#$USER#g; s#<INSTALL_DIR>#$INSTALL_DIR#g" deploy/monster-cycle.service \
+  | sudo tee /etc/systemd/system/monster-cycle.service
+sudo sed "s#<USER>#$USER#g; s#<INSTALL_DIR>#$INSTALL_DIR#g" deploy/monster-cycle.timer \
+  | sudo tee /etc/systemd/system/monster-cycle.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now monster-cycle.timer
+systemctl list-timers monster-cycle --no-pager
+cat var/log/cycle.log
+```
+
+Цикл читает `var/data`, связывает голову цепочки сборщика и решает. Код выхода —
+единственное, что видит таймер, поэтому у каждого факта свой код, а не «2 на
+всякий отказ»:
+
+| код | что случилось | что делать |
+|---|---|---|
+| `0` | цикл прошёл: торговал или отказался и записал почему | ничего |
+| `1` | beast говорит «нет»: сработал kill switch, или цепочка не сходится | `--replay`, `var/log/cycle.log`; kill снимается `--reset-kill` — человеком |
+| `2` | кэш и цепочка описывают разные книги, или магазин не читается | строка `state.diverged` называет оба числа; кэш убрать — книга восстановится из цепочки |
+| `3` | истории меньше окна когерентности: магазин молодой | **ничего**: первые ~2 часа после старта и любая пауза; юнит зелёный |
+| `4` | свежий проход сборщика старше `MONSTER_MAX_SNAPSHOT_AGE_S` | `systemctl status monster-capture`: решение на старых данных — решение о прошлом |
+| `64` | команда в юните написана неверно | править юнит, а не книгу: ничего не было предпринято |
+
+`SuccessExitStatus=3` — единственное смягчение в этих юнитах, и оно одно: «подождать»
+это календарь, а не поломка. Коды `1`, `2`, `4` остаются красными, `systemctl
+--failed` называет `monster-cycle.service`, а в `var/log/cycle.log` лежит строка
+с числами.
+
 ### Первый цикл, который связывает цепочки
 
 Сборщик пишет свою цепочку, книга — свою, и связывает их только цикл: без
 `MONSTER_DATA_JOURNAL` он не знает, что рядом есть вторая цепочка, и `--verify`
-нечего проверять.
+нечего проверять. В `monster-cycle.service` эта переменная прописана явно.
 
 ```bash
 cd "$HOME/entrain-core-workspace/monster"
@@ -236,12 +280,21 @@ export MONSTER_DATA_JOURNAL=var/journal.capture.jsonl
 ```
 
 > **Когда появится первая ссылка.** `journal.linked` пишется перед решением,
-> после `data.derived`, поэтому на молодом магазине цикл откажет раньше:
-> `data: history: 43 of 128 bars fit before ...`. Это отказ молодого магазина,
-> а не поломка — когерентность читается по 128 закрытым минутам, то есть первая
-> ссылка появляется примерно через два часа после старта сборщика. До тех пор
-> `--verify` печатает только строку цепочки без `links:` — это честный ответ
-> «связывать пока нечего», а не пропущенная проверка.
+> после `data.derived`, поэтому на молодом магазине цикл откажет раньше — с
+> кодом `3` и событием `cycle.not_ready` в журнале:
+>
+> ```
+> data: the store holds 0 aligned bar(s) of the 128 the coherence window needs
+> (history: 4 symbol(s) excluded for missing bars (… 43/128 …)); a young store is
+> waited for, not traded on
+> ```
+>
+> Это отказ молодого магазина, а не поломка: когерентность читается по 128
+> закрытым барам, то есть первая ссылка появляется примерно через два часа после
+> старта сборщика. `0 aligned` — не ошибка счёта: пока ни один ряд не покрывает
+> 90 % окна, выравнивать нечего, а число в скобках (`… 43/128 …`) говорит, сколько
+> баров уже есть. До первой ссылки `--verify` печатает только строку цепочки без
+> `links:` — это честный ответ «связывать пока нечего», а не пропущенная проверка.
 
 
 
@@ -335,6 +388,8 @@ cd "$HOME/entrain-core-workspace/monster"
 git pull                                         # или rsync заново
 .venv/bin/python -m monster.data probe --live     # форма ещё та?
 .venv/bin/python -m monster.cycle --verify        # журнал не правили?
+# если менялись deploy/* — переустановить юниты из §4: daemon-reload читает
+# /etc/systemd/system, а не ваш checkout, и сам файлы не переписывает.
 # затем снова команда из §4
 ```
 
@@ -357,8 +412,8 @@ git pull                                         # или rsync заново
 | `links: 1 of 1 do not hold` в `--verify` | цепочку переписали после того, как книга её прочитала | не «чинить» книгу: строка `edited`/`missing` называет файл; без бэкапа неделя под вопросом |
 | `reconcile: diverged` в `--replay` | кэш `var/state.json` и цепочка описывают разные книги | цикл сам откажет (код 2); кэш удаляем — он восстановится из цепочки (`--replay --write-state`) |
 | `reconcile: rebuilt` в логе `book.log` | кэш пропал (не расхождение) | ничего не делать: следующий цикл пересоберёт его из цепочки |
-| `history: N of 128 bars fit` | магазин моложе окна когерентности | не ошибка; решение появится, когда наберётся 128 закрытых минут |
-| `the freshest capture pass is N s old` | сборщик отстал сильнее `MONSTER_MAX_SNAPSHOT_AGE_S` | `systemctl status monster-capture`; решение на старых данных — это решение о прошлом |
+| `cycle.not_ready` / код `3` в `cycle.log` | магазин моложе окна когерентности (128 закрытых баров) | не ошибка: юнит зелёный (`SuccessExitStatus=3`), решение появится через ~2 часа; число `… 43/128 …` в строке говорит, сколько уже есть |
+| `the freshest capture pass is N s old` (код `4`) | сборщик отстал сильнее `MONSTER_MAX_SNAPSHOT_AGE_S` | `systemctl status monster-capture`; решение на старых данных — это решение о прошлом |
 
 Важно: **одна отказавшая биржа не останавливает сбор**. В логе будет
 `17 reading(s)` и имя отказавшего эндпоинта; остальные 17 пишутся. Это
@@ -378,16 +433,18 @@ done
 .venv/bin/python -m monster.cycle --replay >> var/journal.txt
 du -sh var/data >> var/journal.txt
 cp var/log/book.log var/book.txt 2>/dev/null || true
+cp var/log/cycle.log var/cycle.txt 2>/dev/null || true
 for d in $(ls var/data); do
   .venv/bin/python -m monster.data truth-report --store var/data --day "$d" --json >> var/truth.jsonl
 done
 ```
 
-Эти файлы — `probe.txt`, `gaps.txt`, `audit.txt`, `journal.txt`, `truth.jsonl`
-и `book.txt` (ежечасный аудит книги: `ok`, `links: k ok`, `reconcile: ok` или
-строка с обоими разошедшимися числами) — и есть ответ на вопрос «прошла ли Фаза
-1 свои ворота». Ничего не надо пересказывать словами: числа либо сходятся, либо
-нет.
+Эти файлы — `probe.txt`, `gaps.txt`, `audit.txt`, `journal.txt`, `truth.jsonl`,
+`book.txt` (ежечасный аудит книги: `ok`, `links: k ok`, `reconcile: ok` или
+строка с обоими разошедшимися числами) и `cycle.txt` (ежечасный цикл: `ok`,
+отказ с кодом и причиной или `cycle.not_ready` с числом баров) — и есть ответ на
+вопрос «прошла ли Фаза 1 свои ворота». Ничего не надо пересказывать словами:
+числа либо сходятся, либо нет.
 
 ## 10. Чего не делать
 

@@ -114,7 +114,7 @@ def test_a_capture_pass_that_stopped_is_not_a_picture_of_now(tmp_path, demo_stor
         ]
     )
 
-    assert code == 2
+    assert code == 4  # stale: the collector is behind, and 3 is reserved for "young"
     assert "collector is behind" in capsys.readouterr().err
     events = list(Journal(journal_path).events())
     assert [event.kind for event in events] == ["cycle.stale"]
@@ -153,5 +153,74 @@ def test_a_cycle_refuses_to_mix_a_frozen_snapshot_with_a_store(tmp_path, demo_st
             "--journal", str(tmp_path / "journal.jsonl"), "--state", str(tmp_path / "state.json"),
         ]
     )
-    assert code == 2
+    assert code == 64  # a wrong command, not a wrong book: nothing was attempted
     assert "do not pass" in capsys.readouterr().err
+
+
+def test_a_young_store_is_waited_for_and_nothing_is_traded(tmp_path, monkeypatch, capsys):
+    """The first two hours of a week are not a fault; they are a calendar."""
+    from monster.data.capture import Capturer, FileTransport
+    from monster.data.store import Store
+    from monster.data.synthetic import write_demo_tape
+
+    monkeypatch.setenv("MONSTER_COHERENCE_WINDOW", "32")
+    tape = write_demo_tape(tmp_path / "tape", samples=5, interval_s=300.0)
+    store = Store(tmp_path / "data")
+    capturer = Capturer(store, FileTransport(tape.root))
+    for index in range(tape.samples):
+        assert capturer.capture(at=tape.base_ts + index * tape.interval_s).ok
+    journal_path, state_path = tmp_path / "journal.jsonl", tmp_path / "state.json"
+
+    code = cycle_main(
+        [
+            "--store", str(store.root), "--interval", "300",
+            "--max-snapshot-age", "0",
+            "--journal", str(journal_path), "--state", str(state_path),
+        ]
+    )
+
+    assert code == 3, "3 is the one code that means 'wait': 2 and 4 mean 'look'"
+    assert "young store is waited for" in capsys.readouterr().err
+    events = list(Journal(journal_path).events())
+    # The provenance is still recorded — the store said something true, it just said
+    # too little — and the refusal names both numbers instead of a guess.
+    assert [event.kind for event in events] == ["data.derived", "cycle.not_ready"]
+    refusal = events[-1].payload
+    # Five bars cannot cover 90% of a 32-bar window, so no series is aligned yet: the
+    # honest count is zero, and the note beside it says how far the store reaches.
+    assert refusal["bars"] == 0 and refusal["window"] == 32
+    assert any("excluded for missing bars" in note for note in refusal["notes"])
+    assert refusal["interval_s"] == 300.0
+    assert not state_path.exists(), "a cycle that did not decide must not write a book"
+    assert "journal.linked" not in [event.kind for event in events]
+
+
+def test_a_store_with_no_quotes_yet_is_not_ready_either(tmp_path, capsys):
+    """An empty directory is a collector that has not started, not a broken store."""
+    journal_path = tmp_path / "journal.jsonl"
+    code = cycle_main(
+        [
+            "--store", str(tmp_path / "empty"),
+            "--journal", str(journal_path), "--state", str(tmp_path / "state.json"),
+        ]
+    )
+
+    assert code == 3
+    assert "holds no quotes" in capsys.readouterr().err
+    assert list(Journal(journal_path).events()) == []
+
+
+def test_every_exit_code_is_one_fact():
+    """A number that means three things is a number nobody reads."""
+    from monster.cycle import (
+        EXIT_DIVERGED,
+        EXIT_NOT_READY,
+        EXIT_OK,
+        EXIT_REFUSED,
+        EXIT_STALE,
+        EXIT_USAGE,
+    )
+
+    codes = (EXIT_OK, EXIT_REFUSED, EXIT_DIVERGED, EXIT_NOT_READY, EXIT_STALE, EXIT_USAGE)
+    assert codes == (0, 1, 2, 3, 4, 64)
+    assert len(set(codes)) == len(codes)

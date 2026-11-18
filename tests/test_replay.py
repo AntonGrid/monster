@@ -343,7 +343,7 @@ def test_adopting_a_cache_that_already_agrees_writes_no_line(traded, capsys):
 def test_write_state_without_replay_is_refused(traded, capsys):
     capsys.readouterr()
 
-    assert main(["--write-state", "--journal", str(traded.journal_path), "--state", str(traded.state_path)]) == 2
+    assert main(["--write-state", "--journal", str(traded.journal_path), "--state", str(traded.state_path)]) == 64
     assert "--replay" in capsys.readouterr().err
 
 
@@ -361,7 +361,9 @@ def test_the_replay_command_will_not_overwrite_a_diverged_cache(traded, capsys):
     ]
     capsys.readouterr()
 
-    assert main(replay_args) == 1
+    # One code for one fact: ``--replay`` and a cycle call a divergence 2, so a timer
+    # does not have to know which command produced the number.
+    assert main(replay_args) == 2
     assert "refusing to overwrite" in capsys.readouterr().err
     assert json.loads(traded.state_path.read_text(encoding="utf-8"))["venue"]["cash"] == pytest.approx(
         document["venue"]["cash"]
