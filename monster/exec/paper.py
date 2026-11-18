@@ -253,50 +253,63 @@ class PaperVenue:
 
         fills: List[Fill] = []
         for index, (leg, quote, price, qty, margin) in enumerate(priced):
-            fee = leg.notional_usd * self.fee_bps / 1e4
-            self.cash -= margin + fee
-            key = (leg.venue, leg.symbol, leg.kind)
-            existing = self.positions.get(key)
-            if existing is None:
-                self.positions[key] = PaperPosition(
-                    venue=leg.venue,
-                    symbol=leg.symbol,
-                    kind=leg.kind,
-                    strategy=intent.strategy,
-                    entry_side=leg.side,
-                    qty=qty if leg.side == "buy" else -qty,
-                    avg_price=price,
-                    margin_usd=margin,
-                    entry_fee_usd=fee,
-                    cost_usd=leg.notional_usd,
-                    funding_usd=0.0,
-                    opened_ts=stamp,
-                    last_funding_ts=stamp,
-                )
-            else:
-                signed = qty if leg.side == "buy" else -qty
-                weight = abs(existing.qty) + abs(signed)
-                existing.avg_price = (existing.avg_price * abs(existing.qty) + price * abs(signed)) / weight
-                existing.qty += signed
-                existing.margin_usd += margin
-                existing.entry_fee_usd += fee
-                existing.cost_usd += leg.notional_usd
-            fills.append(
-                Fill(
-                    ts=stamp,
-                    strategy=intent.strategy,
-                    venue=leg.venue,
-                    symbol=leg.symbol,
-                    kind=leg.kind,
-                    side=leg.side,
-                    qty=qty,
-                    price=price,
-                    fee_usd=fee,
-                    notional_usd=leg.notional_usd,
-                    leg_index=index,
-                )
+            fill = Fill(
+                ts=stamp,
+                strategy=intent.strategy,
+                venue=leg.venue,
+                symbol=leg.symbol,
+                kind=leg.kind,
+                side=leg.side,
+                qty=qty,
+                price=price,
+                fee_usd=leg.notional_usd * self.fee_bps / 1e4,
+                notional_usd=leg.notional_usd,
+                leg_index=index,
             )
+            self.apply_fill(fill)
+            fills.append(fill)
         return ExecutionResult(intent_id=intent.id, fills=tuple(fills), refused=())
+
+    def apply_fill(self, fill: Fill) -> PaperPosition:
+        """Post one fill to the book: margin and fee out of cash, position in.
+
+        Public because the journal holds every fill: a replay that recomputed
+        the book with different arithmetic would prove nothing about the book it
+        claims to check.  The cash check stays in :meth:`execute`, where the
+        intent is priced as a whole — a replay must not refuse a fill that
+        already happened.
+        """
+        margin = fill.notional_usd * self._margin_fraction(fill.kind)
+        key = (fill.venue, fill.symbol, fill.kind)
+        existing = self.positions.get(key)
+        if existing is None:
+            position = PaperPosition(
+                venue=fill.venue,
+                symbol=fill.symbol,
+                kind=fill.kind,
+                strategy=fill.strategy,
+                entry_side=fill.side,
+                qty=fill.qty if fill.side == "buy" else -fill.qty,
+                avg_price=fill.price,
+                margin_usd=margin,
+                entry_fee_usd=fill.fee_usd,
+                cost_usd=fill.notional_usd,
+                funding_usd=0.0,
+                opened_ts=fill.ts,
+                last_funding_ts=fill.ts,
+            )
+            self.positions[key] = position
+        else:
+            signed = fill.qty if fill.side == "buy" else -fill.qty
+            weight = abs(existing.qty) + abs(signed)
+            existing.avg_price = (existing.avg_price * abs(existing.qty) + fill.price * abs(signed)) / weight
+            existing.qty += signed
+            existing.margin_usd += margin
+            existing.entry_fee_usd += fill.fee_usd
+            existing.cost_usd += fill.notional_usd
+            position = existing
+        self.cash -= margin + fill.fee_usd
+        return position
 
     # ── closing ─────────────────────────────────────────────────────────────
 
@@ -327,7 +340,6 @@ class PaperVenue:
         exit_notional = quantity * price
         exit_fee = exit_notional * self.fee_bps / 1e4
         net = gross - position.entry_fee_usd - exit_fee + position.funding_usd
-        self.cash += position.margin_usd + gross - exit_fee
         trade = ClosedTrade(
             strategy=position.strategy,
             venue=position.venue,
@@ -346,9 +358,29 @@ class PaperVenue:
             closed_ts=stamp,
             reason=reason,
         )
+        self.apply_close(trade)
+        return trade
+
+    def apply_close(self, trade: ClosedTrade) -> float:
+        """Post a closed trade to the book; return the net the position implies.
+
+        The returned number is computed from the position and the recorded exit
+        price rather than read from ``trade.realized_usd``: comparing the two is
+        how a replay notices that the journal's arithmetic and the book's have
+        drifted apart.  ``cash`` is credited with margin and gross minus the exit
+        fee, because the entry fee and the funding were paid as they happened.
+        """
+        key = (trade.venue, trade.symbol, trade.kind)
+        position = self.positions.get(key)
+        if position is None:
+            raise KeyError(f"no open position {key} for the closed trade at {trade.closed_ts}")
+        exit_fee = abs(position.qty) * trade.exit_price * self.fee_bps / 1e4
+        gross = (trade.exit_price - position.avg_price) * position.qty
+        net = gross - position.entry_fee_usd - exit_fee + position.funding_usd
+        self.cash += position.margin_usd + gross - exit_fee
         self.closed.append(trade)
         del self.positions[key]
-        return trade
+        return net
 
     # ── funding ─────────────────────────────────────────────────────────────
 

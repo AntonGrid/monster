@@ -82,6 +82,9 @@ def test_a_cycle_reads_the_store_and_journals_its_provenance(tmp_path, demo_stor
     code = cycle_main(
         [
             "--store", str(store.root), "--interval", "300",
+            # The synthetic tape is dated, not "now": the freshness gate is about
+            # a live collector falling behind, and this run is a replay of a store.
+            "--max-snapshot-age", "0",
             "--journal", str(journal_path), "--state", str(state_path),
         ]
     )
@@ -99,6 +102,27 @@ def test_a_cycle_reads_the_store_and_journals_its_provenance(tmp_path, demo_stor
     assert all(event.ts <= tape.last_ts for event in journal.events())
 
 
+def test_a_capture_pass_that_stopped_is_not_a_picture_of_now(tmp_path, demo_store, monkeypatch, capsys):
+    store, tape = demo_store
+    monkeypatch.setenv("MONSTER_COHERENCE_WINDOW", "32")
+    journal_path, state_path = tmp_path / "journal.jsonl", tmp_path / "state.json"
+    code = cycle_main(
+        [
+            "--store", str(store.root), "--interval", "300",
+            "--max-snapshot-age", "180",
+            "--journal", str(journal_path), "--state", str(state_path),
+        ]
+    )
+
+    assert code == 2
+    assert "collector is behind" in capsys.readouterr().err
+    events = list(Journal(journal_path).events())
+    assert [event.kind for event in events] == ["cycle.stale"]
+    assert events[0].payload["at"] == tape.last_ts
+    assert events[0].payload["limit_s"] == 180.0
+    assert not state_path.exists()
+
+
 def test_the_truth_check_uses_only_the_configured_witnesses(tmp_path, demo_store, monkeypatch, capsys):
     store, _ = demo_store
     monkeypatch.setenv("MONSTER_TRUTH_VENUES", "htx")
@@ -108,6 +132,7 @@ def test_the_truth_check_uses_only_the_configured_witnesses(tmp_path, demo_store
     code = cycle_main(
         [
             "--store", str(store.root), "--interval", "300",
+            "--max-snapshot-age", "0",
             "--journal", str(journal_path), "--state", str(tmp_path / "state.json"),
         ]
     )

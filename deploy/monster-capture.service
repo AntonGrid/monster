@@ -12,7 +12,10 @@ Environment=PYTHONUNBUFFERED=1
 ExecStartPre=/bin/mkdir -p <HOME>/entrain-core-workspace/monster/var/log
 # 10080 passes at 60 s = one week.  The loop wakes on an absolute grid, so a
 # slow answer becomes a recorded Gap instead of a drifting schedule.
-ExecStart=<HOME>/entrain-core-workspace/monster/.venv/bin/python -m monster.data capture --live --store var/data --interval 60 --count 10080 --journal var/journal.jsonl --fsync
+# The collector writes its own chain: two writers on one journal interleave
+# prev/hash and break it, so the cycle keeps var/journal.jsonl to itself and
+# links this chain's head as a journal.linked event.
+ExecStart=<HOME>/entrain-core-workspace/monster/.venv/bin/python -m monster.data capture --live --store var/data --interval 60 --count 10080 --journal var/journal.capture.jsonl --fsync
 Restart=always
 RestartSec=10
 # Restart=always means a crash costs seconds, not a week of data.

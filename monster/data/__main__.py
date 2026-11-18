@@ -5,7 +5,10 @@ them from cron:
 
 ``probe``    asks every endpoint once and says what answered and what it said;
 ``capture``  one pass (or ``--count`` passes) from a file transport or the live
-             venues; writes raw bodies and normalized rows, prints failures;
+             venues; writes raw bodies and normalized rows, prints failures, and
+             journals its passes into its **own** chain
+             (``var/journal.capture.jsonl``), because two writers on one chain
+             break it;
 ``tape``     writes a synthetic tape for offline runs (labelled synthetic);
 ``derive``   prints (and optionally saves) the snapshot and history a cycle
              would see at ``--at``;
@@ -90,6 +93,7 @@ def _capture(args: argparse.Namespace) -> int:
     journal_ok = journal is None or journal.verify() == "ok"
     if journal is not None and not journal_ok:
         print("data: the journal fails verification; this run will not append to it", file=sys.stderr)
+    journal_error: Optional[str] = None
     # A replay is stamped by the grid it replays; a live pass is stamped by the
     # receive clock and merely *woken* by the grid, because the raw body's job
     # is to say when we received it, not when we meant to.
@@ -101,7 +105,15 @@ def _capture(args: argparse.Namespace) -> int:
         report = capturer.capture(at=stamp, wanted=wanted)
         reports.append(report)
         if journal is not None and journal_ok:
-            journal.append("data.captured", report.to_dict(), ts=stamp)
+            try:
+                journal.append("data.captured", report.to_dict(), ts=stamp)
+            except JournalError as error:
+                # The data matters more than the record of it: a collector that
+                # dies because somebody shares its journal stops collecting, and
+                # then the store has a gap *and* the journal has a hole.  Say so
+                # once, keep capturing, and exit non-zero at the end.
+                journal_ok, journal_error = False, str(error)
+                print(f"data: journal disabled: {error}", file=sys.stderr)
         if not args.json:
             print(report.describe())
         if args.live and index + 1 < passes:
@@ -115,6 +127,9 @@ def _capture(args: argparse.Namespace) -> int:
             _sleep_until(next_at)
     if args.json:
         print(json.dumps([report.to_dict() for report in reports], indent=2, sort_keys=True))
+    if journal_error is not None:
+        print(f"data: the journal was not written: {journal_error}", file=sys.stderr)
+        return 1
     return 0 if all(report.ok for report in reports) else 1
 
 
@@ -267,7 +282,10 @@ def _parser() -> argparse.ArgumentParser:
         "--workers", type=int, default=8, help="requests in flight at once (1 = strictly sequential)"
     )
     capture.add_argument("--fsync", action="store_true", help="fsync every day file after a write")
-    capture.add_argument("--journal", help="append data.captured events to this journal")
+    capture.add_argument(
+        "--journal",
+        help="append data.captured events to this journal — the collector's own chain, never the cycle's",
+    )
     capture.add_argument("--json", action="store_true")
     capture.set_defaults(handler=_capture)
 

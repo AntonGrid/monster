@@ -32,8 +32,12 @@ hands are ``ENRG-HFT``'s, and this package hands it an ``Intent``, not a
 credential.
 
 The paper book's state lives in a JSON cache beside the journal.  The journal is
-authoritative for *why*; the cache is a convenience for *what*, and a cache that
-is lost can be rebuilt by replaying the journal in a later version of this file.
+authoritative for *why* and for *what*: before a cycle trades it replays the
+chain (``monster.replay``) and compares the result with the cache.  A cache that
+agrees is used; a missing cache is refilled from the chain; a cache that
+disagrees stops the cycle and writes ``state.diverged``.  The cache is a
+convenience for speed, and a convenience that cannot be checked is a second
+opinion about the book — which is exactly one too many.
 """
 from __future__ import annotations
 
@@ -41,6 +45,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
@@ -53,6 +58,7 @@ from monster.config import Config
 from monster.contracts import ClosedTrade, Snapshot
 from monster.exec.paper import FundingReport, PaperVenue, Unpriced
 from monster.journal import Journal, JournalError
+from monster.replay import reconcile
 from monster.risk.limits import KillSwitch, check
 from monster.strategies.carry import CarryScan, scan_carry
 
@@ -430,6 +436,75 @@ def _decide(
     )
 
 
+def _link_capture_chain(config: Config, journal: Journal, *, ts: float) -> None:
+    """Write the head of the data collector's chain into the trading chain.
+
+    The collector keeps its own journal because two writers on one chain break it
+    (``Journal.append`` refuses such a file outright).  The link is what keeps
+    the split honest: every cycle records which version of the capture history it
+    was reading, so a capture file edited afterwards no longer matches what the
+    book says it saw.  A checkout with no collector has nothing to link, which is
+    not an error.
+    """
+    path = config.data_journal_path
+    if path is None or not Path(path).exists() or journal.verify() != "ok":
+        return
+    try:
+        capture = Journal(path, fsync=False)
+        verdict, head, events = capture.verify(), capture.last(), capture.count()
+    except JournalError as error:
+        journal.append(
+            "journal.linked",
+            {"chain": "capture", "path": str(path), "verdict": str(error), "head": None, "seq": None, "events": None},
+            ts=ts,
+        )
+        return
+    journal.append(
+        "journal.linked",
+        {
+            "chain": "capture",
+            "path": str(path),
+            "verdict": verdict,
+            "head": None if head is None else head.hash,
+            "seq": None if head is None else head.seq,
+            "events": events,
+        },
+        ts=ts,
+    )
+
+
+def _replay_command(
+    args: argparse.Namespace,
+    journal: Journal,
+    journal_path: Path,
+    state_path: Path,
+    config: Config,
+) -> int:
+    """``--replay``: print the book the journal describes, and compare it."""
+    verdict = journal.verify()
+    if verdict != "ok":
+        print(f"{journal_path}: {verdict} — the journal cannot be replayed", file=sys.stderr)
+        return 1
+    cached = load_state(state_path, config)[0] if state_path.exists() else None
+    outcome = reconcile(journal, config, cached)
+    print(outcome.describe())
+    if not args.write_state:
+        return 1 if outcome.diverged else 0
+    if outcome.diverged:
+        print(
+            "refusing to overwrite the cache: the two accounts disagree and this command cannot "
+            "prove which is right — move the cache aside to adopt the journal's book",
+            file=sys.stderr,
+        )
+        return 1
+    kill = load_state(state_path, config)[1] if state_path.exists() else KillSwitch()
+    save_state(state_path, outcome.book, kill)
+    if outcome.mode != "ok":
+        journal.append("state.rebuilt", outcome.to_dict())
+    print(f"{state_path}: written from the journal ({outcome.events} events)")
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI: ``python -m monster.cycle (--snapshot file | --store dir) [--history file]``."""
     parser = argparse.ArgumentParser(
@@ -444,7 +519,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--bars", type=int, help="history bars for --store (default: the coherence window)")
     parser.add_argument("--journal", help="journal path (overrides MONSTER_JOURNAL)")
     parser.add_argument("--state", help="state cache path (overrides MONSTER_STATE)")
-    parser.add_argument("--verify", action="store_true", help="verify the journal chain and exit")
+    parser.add_argument(
+        "--replay",
+        action="store_true",
+        help="rebuild the book from the journal and compare it with the state cache",
+    )
+    parser.add_argument(
+        "--write-state",
+        action="store_true",
+        help="with --replay: adopt the journal's book as the new cache",
+    )
+    parser.add_argument(
+        "--max-snapshot-age",
+        type=float,
+        metavar="SECONDS",
+        help="--store without --at: refuse a pass older than this (default MONSTER_MAX_SNAPSHOT_AGE_S; 0 disables)",
+    )
+    parser.add_argument("--verify", action="store_true", help="verify this chain and the chains it links, then exit")
+    parser.add_argument(
+        "--no-links",
+        action="store_true",
+        help="with --verify: check only this chain, not the chains it links",
+    )
     parser.add_argument("--reset-kill", metavar="OPERATOR", help="clear the kill switch, naming the human doing it")
     parser.add_argument("--json", action="store_true", help="print the cycle report as JSON")
     args = parser.parse_args(argv)
@@ -461,7 +557,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.verify:
         verdict = journal.verify()
         print(f"{journal_path}: {verdict} ({journal.count()} events)")
-        return 0 if verdict == "ok" else 1
+        if verdict != "ok":
+            return 1
+        if args.no_links:
+            return 0
+        # The chain proves this file was not edited.  The links prove the *other*
+        # files were not edited after this one read them: a cycle that recorded
+        # "the capture chain had 130 lines, head 4f1a..." is making a claim, and
+        # a claim nobody checks is a comment.
+        links = journal.verify_links()
+        for report in links:
+            print(report.describe(), file=sys.stdout if report.ok else sys.stderr)
+        broken = [report for report in links if not report.ok]
+        if broken:
+            print(
+                f"links: {len(broken)} of {len(links)} do not hold — a chain this book read from was "
+                "changed after it read from it; the past this book describes is not the past on disk",
+                file=sys.stderr,
+            )
+            return 1
+        if links:
+            print(f"links: {len(links)} ok")
+        return 0
+
+    if args.replay:
+        return _replay_command(args, journal, journal_path, state_path, config)
+
+    if args.write_state:
+        print("--write-state only makes sense with --replay", file=sys.stderr)
+        return 2
 
     venue, kill = load_state(state_path, config)
     if args.reset_kill:
@@ -476,6 +600,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"journal={journal_path} ({journal.count()} events, {journal.verify()})")
         print("nothing to do: pass --snapshot or --store to run a cycle", file=sys.stderr)
         return 2
+
+    # The cache is a convenience; the chain is the book.  A cache that disagrees
+    # is refused rather than averaged, and a cache that has gone missing is
+    # refilled from the journal: a phantom position is a disagreement nobody
+    # asked about, and this is the question that catches it.
+    outcome = reconcile(journal, config, venue if state_path.exists() else None)
+    if outcome.diverged:
+        journal.append("state.diverged", outcome.to_dict())
+        print(outcome.describe(), file=sys.stderr)
+        print(
+            "the state cache and the journal describe different books; nothing was traded. "
+            "Move the cache aside to trade the journal's book, or investigate the divergence.",
+            file=sys.stderr,
+        )
+        return 2
+    if outcome.mode == "rebuilt":
+        journal.append("state.rebuilt", outcome.to_dict())
+        save_state(state_path, outcome.book, kill)
+        print(f"state: rebuilt from the journal ({outcome.events} events)", file=sys.stderr)
+    venue = outcome.book
 
     data_notes: Tuple[str, ...] = ()
     if args.store:
@@ -500,6 +644,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         snapshot = derivation.snapshot
         history = derivation.history
         data_notes = derivation.notes
+        # A pass that stopped three intervals ago is not a picture of now, and a
+        # decision on it would be about the past.  This checks only the runs that
+        # mean "as of now": an explicit --at is a replay of a chosen moment, and
+        # freshness is then enforced per quote by derive.
+        limit = config.snapshot_max_age_s if args.max_snapshot_age is None else float(args.max_snapshot_age)
+        if args.at is None and limit > 0.0:
+            age = time.time() - snapshot.ts
+            if age > limit:
+                if journal.verify() == "ok":
+                    journal.append(
+                        "cycle.stale",
+                        {"age_s": age, "limit_s": limit, "at": snapshot.ts},
+                        ts=snapshot.ts,
+                    )
+                print(
+                    f"data: the freshest capture pass is {age:.0f}s old (limit {limit:.0f}s): "
+                    "the collector is behind, and a decision on this data would be about the past",
+                    file=sys.stderr,
+                )
+                return 2
+            data_notes = tuple(data_notes) + (f"capture pass age at decision time: {age:.1f}s",)
         # The provenance is written before the decision, and only into a journal
         # that still verifies: a broken past gets no new lines from this process.
         if journal.verify() == "ok":
@@ -512,9 +677,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.history:
             history = json.loads(Path(args.history).expanduser().read_text(encoding="utf-8"))
 
-    report = run_cycle(
-        config, snapshot, journal=journal, venue=venue, kill=kill, history=history, notes=data_notes
-    )
+    # Two chains, tied together before anything is decided: the capture journal
+    # says what the world looked like, and this line says which version of it the
+    # book was reading.
+    try:
+        _link_capture_chain(config, journal, ts=snapshot.ts)
+        report = run_cycle(
+            config, snapshot, journal=journal, venue=venue, kill=kill, history=history, notes=data_notes
+        )
+    except JournalError as error:
+        print(f"journal: {error}", file=sys.stderr)
+        return 2
     save_state(state_path, venue, kill)
     print(json.dumps(report.to_dict(), indent=2, sort_keys=True) if args.json else report.describe())
     return 0 if not report.killed else 1

@@ -54,6 +54,13 @@ def _path(env: Mapping[str, str], name: str, default: Path) -> Path:
     return Path(str(raw)).expanduser()
 
 
+def _optional_path(env: Mapping[str, str], name: str) -> Optional[Path]:
+    raw = env.get(name)
+    if raw is None or not str(raw).strip():
+        return None
+    return Path(str(raw)).expanduser()
+
+
 @dataclass(frozen=True)
 class Config:
     """The paper book's numbers, as the operator set them."""
@@ -80,6 +87,17 @@ class Config:
     funding_max_age_h: float = 12.0
     journal_path: Path = field(default_factory=lambda: Path("var/journal.jsonl"))
     state_path: Path = field(default_factory=lambda: Path("var/state.json"))
+    #: The data collector's own chain.  Two writers never share one journal, so
+    #: the capture service writes ``var/journal.capture.jsonl`` while the cycle
+    #: writes ``var/journal.jsonl`` and records the other chain's head as a
+    #: ``journal.linked`` event.  ``None`` means "this checkout has no capture
+    #: chain", and the cycle then simply does not link one.
+    data_journal_path: Optional[Path] = None
+    #: How old the freshest capture pass may be before a cycle refuses to treat it
+    #: as "now".  The default is three passes at the configured interval: one lost
+    #: pass is a gap, three is a collector that has stopped.  Zero disables the
+    #: check, for a deliberate replay of an old store.
+    snapshot_max_age_s: float = 180.0
     limits: Limits = field(default_factory=Limits)
 
     def __post_init__(self) -> None:
@@ -113,6 +131,16 @@ class Config:
             raise ValueError("quote_max_age_s must be positive")
         if self.funding_max_age_h <= 0.0:
             raise ValueError("funding_max_age_h must be positive")
+        if self.snapshot_max_age_s < 0.0:
+            raise ValueError("snapshot_max_age_s must be zero (disabled) or positive")
+        if self.data_journal_path is not None:
+            capture = Path(self.data_journal_path).expanduser().resolve()
+            book = Path(self.journal_path).expanduser().resolve()
+            if capture == book:
+                raise ValueError(
+                    f"the capture journal and the cycle journal are the same file ({book}): "
+                    "two writers on one chain break it, so the collector gets its own journal"
+                )
 
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "Config":
@@ -151,6 +179,8 @@ class Config:
             funding_max_age_h=_float(source, "MONSTER_MAX_FUNDING_AGE_H", 12.0),
             journal_path=_path(source, "MONSTER_JOURNAL", Path("var/journal.jsonl")),
             state_path=_path(source, "MONSTER_STATE", Path("var/state.json")),
+            data_journal_path=_optional_path(source, "MONSTER_DATA_JOURNAL"),
+            snapshot_max_age_s=_float(source, "MONSTER_MAX_SNAPSHOT_AGE_S", 180.0),
             limits=limits,
         )
 
@@ -176,5 +206,7 @@ class Config:
             "funding_max_age_h": self.funding_max_age_h,
             "journal_path": str(self.journal_path),
             "state_path": str(self.state_path),
+            "data_journal_path": None if self.data_journal_path is None else str(self.data_journal_path),
+            "snapshot_max_age_s": self.snapshot_max_age_s,
             "limits": self.limits.to_dict(),
         }
