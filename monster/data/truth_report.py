@@ -251,6 +251,7 @@ def _passes(
     z_threshold: float,
     max_deviation_bps: float,
     max_age_s: float,
+    min_deviation_bps: float = 0.0,
 ) -> List[_Pass]:
     """Group the day into capture passes, one pass per cluster of stamps.
 
@@ -272,6 +273,7 @@ def _passes(
             min_venues=min_venues,
             max_age_s=max_age_s,
             max_deviation_bps=max_deviation_bps,
+            min_deviation_bps=min_deviation_bps,
         )
         mids: Dict[str, Dict[str, float]] = {}
         for quote in items:
@@ -326,8 +328,15 @@ def truth_day(
     z_threshold: float = DEFAULT_Z,
     max_deviation_bps: float = DEFAULT_MAX_DEVIATION_BPS,
     max_age_s: float = DEFAULT_MAX_AGE_S,
+    min_deviation_bps: float = 0.0,
 ) -> TruthDay:
-    """Replay one day of the truth check and classify every finding it made."""
+    """Replay one day of the truth check and classify every finding it made.
+
+    ``min_deviation_bps`` is the materiality floor: replay the same day at
+    several floors and the false-positive share says which one stops the check
+    from calling microstructure a lie.  The default replays the check exactly as
+    the cycle runs it.
+    """
     days = store.days()
     target = day or (days[-1] if days else "")
     if not target:
@@ -343,6 +352,7 @@ def truth_day(
         z_threshold=z_threshold,
         max_deviation_bps=max_deviation_bps,
         max_age_s=max_age_s,
+        min_deviation_bps=min_deviation_bps,
     )
     sections = sum(len(item.report.checked) for item in passes)
     unmeasured = sorted(

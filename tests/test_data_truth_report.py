@@ -140,6 +140,42 @@ def test_the_day_is_reported_as_json_and_the_gate_exits_nonzero(tmp_path):
     assert main(["truth-report", "--store", str(tmp_path), "--max-fp-share", "1.0"]) == 0
 
 
+def test_a_materiality_floor_stops_microstructure_being_called_a_lie(tmp_path):
+    """With three venues the z measures how alone a venue is, not how big the lie is.
+
+    Two venues agree to 0.2 bps and the third is 1.8 bps away: the MAD is set by
+    the pair that agree, so z ≈ 6 and the check fires on a gap smaller than the
+    spread a mid can legitimately differ by.  The VPS replayed a full day at
+    0.4–3.3 bps and got 1 935 findings in 5 421 cross-sections.
+    """
+    store = Store(tmp_path)
+    for offset in (0, 60):
+        _pass(store, offset, (100.000, 100.002, 100.020))
+    unfenced = truth_day(store, DAY)
+    assert [event.verdict for event in unfenced.events] == ["persistent", "unknown"]
+    assert unfenced.events[0].deviation_bps == pytest.approx(1.8, abs=0.05)
+
+    floored = truth_day(store, DAY, min_deviation_bps=2.0)
+    assert floored.events == ()
+    assert floored.sections == 2  # the symbol is still measured, just not lied about
+    assert floored.false_positive_share is None
+
+
+def test_the_cli_sweeps_the_materiality_floor_in_one_pass(tmp_path, capsys):
+    from monster.data.__main__ import main
+
+    store = Store(tmp_path)
+    for offset in (0, 60):
+        _pass(store, offset, (100.000, 100.002, 100.020))
+    assert main(["truth-report", "--store", str(tmp_path), "--min-bps", "0,2"]) == 0
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert len(lines) == 3  # a header and one row per floor
+    assert "bps floor" in lines[0] and "findings" in lines[0]
+    assert lines[1].startswith("        0.0") and lines[2].startswith("        2.0")
+    assert lines[2].split()[1] == "0"  # the floor leaves no finding to explain
+    assert main(["truth-report", "--store", str(tmp_path), "--min-bps", "lots"]) == 2
+
+
 def test_a_store_with_no_day_is_a_question_that_cannot_be_asked(tmp_path):
     from monster.data.derive import DataError
 

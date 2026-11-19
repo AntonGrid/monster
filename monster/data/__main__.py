@@ -228,26 +228,59 @@ def _gaps(args: argparse.Namespace) -> int:
 def _truth(args: argparse.Namespace) -> int:
     store = Store(args.store)
     try:
-        report = truth_day(
-            store,
-            args.day,
-            min_venues=args.min_venues,
-            z_threshold=args.z,
-            max_deviation_bps=args.max_deviation_bps,
-        )
+        floors = tuple(float(part) for part in _split(args.min_bps)) or (0.0,)
+    except ValueError:
+        print(f"data: --min-bps is a list of bps numbers, not {args.min_bps!r}", file=sys.stderr)
+        return 2
+    reports = []
+    try:
+        for floor in floors:
+            reports.append(
+                truth_day(
+                    store,
+                    args.day,
+                    min_venues=args.min_venues,
+                    z_threshold=args.z,
+                    max_deviation_bps=args.max_deviation_bps,
+                    min_deviation_bps=floor,
+                )
+            )
     except (DataError, StoreError) as error:
         print(f"data: {error}", file=sys.stderr)
         return 2
-    print(json.dumps(report.to_dict(), indent=2, sort_keys=True) if args.json else report.describe())
+    if args.json:
+        payload = [report.to_dict() for report in reports]
+        print(json.dumps(payload[0] if len(payload) == 1 else payload, indent=2, sort_keys=True))
+    elif len(reports) == 1:
+        print(reports[0].describe())
+    else:
+        print(_sweep(reports, floors))
     if args.max_fp_share is not None:
-        share = report.false_positive_share
-        if share is not None and share > args.max_fp_share:
+        worst = max(
+            (report.false_positive_share for report in reports if report.false_positive_share is not None),
+            default=None,
+        )
+        if worst is not None and worst > args.max_fp_share:
             print(
-                f"truth: false-positive share {share:.1%} exceeds {args.max_fp_share:.1%}",
+                f"truth: false-positive share {worst:.1%} exceeds {args.max_fp_share:.1%}",
                 file=sys.stderr,
             )
             return 1
     return 0
+
+
+def _sweep(reports, floors) -> str:
+    """One line per materiality floor: what the gate costs and what it buys."""
+    rows = ["  bps floor  findings  snapped back      share  per section  judged"]
+    for floor, report in zip(floors, reports):
+        share = report.false_positive_share
+        per_section = report.false_positives_per_section
+        rows.append(
+            f"{floor:11.1f} {len(report.events):9d} {report.false_positives:13d} "
+            f"{'n/a' if share is None else f'{share:6.1%}':>10} "
+            f"{'n/a' if per_section is None else f'{per_section:11.2e}':>12} {report.judged:7d}"
+        )
+    return "\n".join(rows)
 
 
 def _doctor(args: argparse.Namespace) -> int:
@@ -371,6 +404,15 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=100.0,
         help="flag when the others agree exactly and the venue is this far off",
+    )
+    truth.add_argument(
+        "--min-bps",
+        default="0",
+        help=(
+            "materiality floor: a deviation below this many bps is not a finding, "
+            "whatever the z says; a comma list (0,1,2,3) sweeps the floor and "
+            "prints the gate for each"
+        ),
     )
     truth.add_argument(
         "--max-fp-share",

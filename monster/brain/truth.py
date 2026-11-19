@@ -46,6 +46,14 @@ DEFAULT_MAX_AGE_S = 5.0
 #: a deviation this large is a finding even without a scale to divide by.
 DEFAULT_MAX_DEVIATION_BPS = 100.0
 
+#: A deviation below this is not a lie, whatever the robust z says.  With three
+#: venues the scale is set by the two that agree most closely, so a venue one
+#: basis point away from two venues that agree to a tenth of one scores z ≈ 10:
+#: the z measures how alone a venue is, not how far the lie reaches.  The cycle
+#: keeps the floor at ``0.0`` until the false-positive instrument has measured a
+#: better one — ``truth-report --min-bps 0,1,2,3`` is that measurement.
+DEFAULT_MIN_DEVIATION_BPS = 0.0
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -126,11 +134,16 @@ def cross_venue_truth(
     min_venues: int = MIN_VENUES,
     max_age_s: float = DEFAULT_MAX_AGE_S,
     max_deviation_bps: float = DEFAULT_MAX_DEVIATION_BPS,
+    min_deviation_bps: float = DEFAULT_MIN_DEVIATION_BPS,
 ) -> TruthReport:
     """Flag stale quotes and venues that disagree with the robust cross-section.
 
     The report is per **snapshot**, not per venue: it answers "may I trade this
     symbol now", and the answer is allowed to be "I cannot tell".
+
+    ``min_deviation_bps`` is a floor on how far the venue must be from the median
+    before the disagreement is a finding at all: below it, the venues are quoting
+    the same asset and the difference is microstructure, however small the MAD is.
     """
     stamp = float(snapshot.ts if now is None else now)
     findings: List[Finding] = []
@@ -178,6 +191,10 @@ def cross_venue_truth(
         scale = 1.4826 * mad
         for venue, deviation in deviations.items():
             deviation_bps = 0.0 if centre == 0.0 else 1e4 * deviation / centre
+            # Silence, not a finding: below the floor the venues are quoting the
+            # same asset and the gap is microstructure, however small the MAD.
+            if abs(deviation_bps) < min_deviation_bps:
+                continue
             z = None if scale == 0.0 else deviation / scale
             if z is not None and abs(z) > z_threshold:
                 findings.append(

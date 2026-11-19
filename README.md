@@ -275,7 +275,8 @@ monster/
       quality.py   gaps, coverage, audit(raw vs normalized)
       doctor.py    eight readings at this minute: store, freshness, coverage, gaps,
                    journal, readiness, truth, disk — exit 0/1/2, writes nothing
-      truth_report.py replay the truth check over a day; classify each finding
+      truth_report.py replay the truth check over a day; classify each finding,
+                   sweep a materiality floor (--min-bps 0,1,2,3)
       derive.py    as-of snapshot, aligned history, notes
       synthetic.py a synthetic tape, labelled as such
   data/raw-fixtures/  venue-shaped bodies for offline parser/capture tests
