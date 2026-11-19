@@ -144,7 +144,19 @@ def cross_venue_truth(
     ``min_deviation_bps`` is a floor on how far the venue must be from the median
     before the disagreement is a finding at all: below it, the venues are quoting
     the same asset and the difference is microstructure, however small the MAD is.
+
+    ``min_venues`` below :data:`MIN_VENUES` is refused rather than honoured: with
+    two venues the median *is* one of the two mids, so the "disagreement" is
+    whichever venue the median did not land on — the check would decide by
+    accident and report it as a measurement.  A caller that wants a weaker check
+    has to change :data:`MIN_VENUES` in a commit, where it can be seen.
     """
+    if min_venues < MIN_VENUES:
+        raise ValueError(
+            f"min_venues={min_venues}: {min_venues} venue(s) cannot tell a liar from the "
+            f"truth, because the median of two mids is one of them; the floor is "
+            f"MIN_VENUES={MIN_VENUES}"
+        )
     stamp = float(snapshot.ts if now is None else now)
     findings: List[Finding] = []
     unmeasured: List[str] = []

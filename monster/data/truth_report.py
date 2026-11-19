@@ -138,6 +138,12 @@ class TruthDay:
     sections: int
     unmeasured: Tuple[str, ...] = ()
     events: Tuple[TruthEvent, ...] = ()
+    #: Symbol-passes the check could not judge because fewer than ``MIN_VENUES``
+    #: venues quoted them.  ``sections`` is the denominator of the rate and this
+    #: is the denominator a gate also needs: a share of findings computed over
+    #: the 10 % of the day that happened to be measurable is not a share over
+    #: the day.  Named symbols are in :attr:`unmeasured`; the count is here.
+    unmeasured_sections: int = 0
 
     def counts(self) -> Dict[str, int]:
         found = {verdict: 0 for verdict in VERDICTS}
@@ -164,9 +170,23 @@ class TruthDay:
         """Noise findings per cross-section judged — the gate's rate over time."""
         return None if self.sections == 0 else self.false_positives / self.sections
 
+    @property
+    def measured_share(self) -> Optional[float]:
+        """The fraction of the day's symbol-passes the check could actually see.
+
+        ``None`` when nothing was written at all; a day that holds one hour of
+        quotes has a high share over a negligible denominator, which is why the
+        gate reads the count beside the share (``sections``) and not the share
+        alone.
+        """
+        total = self.sections + self.unmeasured_sections
+        return None if total == 0 else self.sections / total
+
     def describe(self, *, limit: int = 10) -> str:
         head = f"truth {self.day}: {self.passes} pass(es), {self.sections} cross-section(s) judged"
-        if self.unmeasured:
+        if self.unmeasured_sections:
+            head += f", {self.unmeasured_sections} symbol-pass(es) unmeasured"
+        elif self.unmeasured:
             head += f", {len(self.unmeasured)} symbol(s) unmeasured"
         if not self.events:
             return head + " · no finding: nothing to explain"
@@ -193,6 +213,8 @@ class TruthDay:
             "passes": self.passes,
             "sections": self.sections,
             "unmeasured": list(self.unmeasured),
+            "unmeasured_sections": self.unmeasured_sections,
+            "measured_share": self.measured_share,
             "events": [event.to_dict() for event in self.events],
             "counts": self.counts(),
             "judged": self.judged,
@@ -355,6 +377,7 @@ def truth_day(
         min_deviation_bps=min_deviation_bps,
     )
     sections = sum(len(item.report.checked) for item in passes)
+    unmeasured_sections = sum(len(item.report.unmeasured) for item in passes)
     unmeasured = sorted(
         {
             symbol
@@ -412,5 +435,6 @@ def truth_day(
         sections=sections,
         unmeasured=tuple(unmeasured),
         events=tuple(events),
+        unmeasured_sections=unmeasured_sections,
     )
 

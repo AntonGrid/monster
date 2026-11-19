@@ -36,7 +36,7 @@ neither, so they run on a machine that only has this repository.
 
 ```bash
 cd monster
-../ENRG-AI/.venv/bin/python -m pytest          # 212 tests, no network
+../ENRG-AI/.venv/bin/python -m pytest          # 242 tests, no network
 
 # 0. One question per endpoint: does the venue answer the shape we parse, or
 #    merely answer?  It writes nothing, so it is safe to run first.
@@ -266,6 +266,8 @@ monster/
     autopsy.py     per-strategy expectancy with ENRG-AI's resolution gate
     cycle.py       the loop and the CLI
     config.py      MONSTER_* environment, validated
+    gate.py        Phase 1's two-sided gate: pass / fail / not measurable, judged
+                   on the Clopper-Pearson bound rather than the point estimate
     data/
       raw.py       RawPayload, ShapeError, decimal/timestamp rules
       parsers.py   HTX / OKX / Bybit bodies -> contracts, identity-checked
@@ -285,6 +287,6 @@ monster/
                       monster-book.{service,timer} is the hourly verify+replay audit,
                       monster-cycle.{service,timer} the hourly cycle (green only on 3)
   docs/VPS.md         the operator runbook: install, probe, run, check, report
-  tests/              212 tests: every refusal has one
+  tests/              242 tests: every refusal has one
   docs/MONSTER.md     charter, roadmap, integration plan, non-negotiables
 ```

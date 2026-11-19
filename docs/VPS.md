@@ -17,6 +17,12 @@
 | воспроизводимость | `python -m monster.data audit --store var/data --day <день>` | 100 % ключей: raw → normalized |
 | сбор идёт | `tail var/log/capture.log` | строка в минуту, `18 reading(s), 18 raw body(ies)` |
 | журнал цел | `python -m monster.cycle --verify` | `ok (N events)` и `links: k ok` |
+| ворота Фазы 1 | `python -m monster.gate --store var/data --day 2026-11-20 … 2026-11-24` | exit 0 по правилам `docs/prereg/2026-11-19-truth-materiality-floor.md` |
+
+Порог материальности (3 bps) и окно hold-out заморожены **19.11, до чтения
+hold-out**; 17–18.11 остаются калибровкой, 19.11 — днём утечки, в выборку не
+входит.  Поэтому «семь суток» здесь означают пять суток, на которых ворота
+считаются, плюс два дня, на которых они писались.
 
 
 Если покрытие ниже — это не «почти получилось»: это другой набор данных, и он
@@ -332,6 +338,18 @@ du -sh var/data && ls var/data | tail -3
 
 # 6. книга сходится: цепочки целы, кэш — та же книга
 .venv/bin/python -m monster.cycle --verify && .venv/bin/python -m monster.cycle --replay
+
+# 7. ворота Фазы 1 целиком, те же данные, один ответ.
+#    0 — пройдены, 1 — провалены (дефект данных или доля выше ворот),
+#    3 — измерить нельзя (мало данных): это «подожди», а не «всё хорошо».
+#    Порог 3 bps и ворота 1 % заморожены в docs/prereg/2026-11-19-truth-materiality-floor.md;
+#    hold-out читается пачкой пяти дней (см. §9), по одному дню — только чтобы
+#    увидеть, что сбор жив.
+.venv/bin/python -m monster.gate --store var/data \
+  --day "$(date -u -d yesterday +%F)" \
+  --receipt "var/gate-$(date -u -d yesterday +%F).json" \
+  --journal var/journal.jsonl
+
 systemctl --failed --no-pager       # пусто — значит ничего не сломано
 ```
 
@@ -533,14 +551,50 @@ cp var/log/cycle.log var/cycle.txt 2>/dev/null || true
 for d in $(ls var/data); do
   .venv/bin/python -m monster.data truth-report --store var/data --day "$d" --json >> var/truth.jsonl
 done
+# ворота Фазы 1: один ответ на всю неделю и его артефакт.
+# Дни калибровки и утечки сюда не входят — только окно из предрегистрации.
+.venv/bin/python -m monster.gate --store var/data \
+  --day 2026-11-20 2026-11-21 2026-11-22 2026-11-23 2026-11-24 \
+  --receipt var/gate-phase1.json --journal var/journal.jsonl > var/gate.txt
 ```
 
 Эти файлы — `probe.txt`, `gaps.txt`, `audit.txt`, `journal.txt`, `truth.jsonl`,
+`gate.txt` + `gate-phase1.json` (вердикт ворот и его receipt),
 `book.txt` (ежечасный аудит книги: `ok`, `links: k ok`, `reconcile: ok` или
 строка с обоими разошедшимися числами) и `cycle.txt` (ежечасный цикл: `ok`,
 отказ с кодом и причиной или `cycle.not_ready` с числом баров) — и есть ответ на
 вопрос «прошла ли Фаза 1 свои ворота». Ничего не надо пересказывать словами:
-числа либо сходятся, либо нет.
+числа либо сходятся, либо нет.  Если `gate.txt` говорит `unmeasurable` — это
+не «почти прошли», а «на этих данных ворота не заданы»: смотри, какое из
+условий (`coverage`, `audit`, `sample`, `truth.decision`) не набрало выборки.
+
+`gate-phase1.json` — receipt, а не лог: в нём `policy` (все числа ворот, включая
+`min_bps`, `min_venues`, `z`, `max_age_s`, `max_deviation_bps`) и `classifier`
+(`snap_fraction`, `snap_floor_bps`, `follow_fraction`, `fp_verdict`).  Поэтому
+вердикт можно перечитать через месяц и получить тот же ответ, не сверяясь с
+историей коммитов.  Сам `monster.gate` **не** стоит в таймере: ворота читают
+окно, которое должно закончиться, а таймер, сработавший в середине окна, напишет
+`unmeasurable` и создаст видимость результата.
+
+## 9a. Пока Rust-зверь остановлен
+
+Пока `ENRG-AI` не запущен, `monster.cycle` и `monster.book` работать не могут (им
+нужны фиды), а их строки в журнале будут отказами, а не книгой:
+
+```bash
+sudo systemctl disable --now monster-cycle.timer monster-book.timer
+systemctl is-active monster-capture.service monster-probe.timer monster-audit.timer
+```
+
+На время окна нужны **только** сбор и аудит данных: `capture` (пишет
+`var/data`, `--count 10080` — неделя проходов), `probe` (ежечасно) и `audit`
+(ежедневно в 00:10 UTC за вчерашний день).  Если `capture` перезапускается
+посреди дня, в этот день появляется пропуск; `Restart=always` +
+`RestartSec=10` дают не больше одного пропущенного слота на рестарт, а ворота
+требуют 1380 из 1441 слота — то есть запас есть ровно на такие рестарты, но не на
+часовую дыру.  Окно закрывается в 00:00 UTC 25.11; аудит за 24.11 запускается в
+00:10, поэтому ворота имеют смысл не раньше этого времени (внутри `monster.gate`
+аудит считается сам, но `var/audit.txt` тогда ещё не содержит 24.11).
 
 ## 10. Чего не делать
 
