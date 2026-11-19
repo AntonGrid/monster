@@ -16,7 +16,13 @@ them from cron:
 ``gaps``     missing slots and coverage for a window;
 ``truth-report`` replays the truth check over a day and classifies its findings
              by what the next pass did — the instrument for the false-positive
-             gate, which cannot be measured at the moment of a refusal.
+             gate, which cannot be measured at the moment of a refusal;
+``doctor``   one screen over everything above, judged at this minute: store,
+             freshness, coverage, gaps, the capture chain, whether the cycle can
+             derive a snapshot, what the truth check flags, and the disk.  It
+             writes nothing, so it is safe to run while the collector appends,
+             and it separates ``wait`` (a young store) from ``warn``/``fail``
+             (a human should look).
 
 Every command returns a process exit code: 0 when the answer is clean, 1 when
 it is not, 2 when the question could not be asked.  A cron job that ignores
@@ -33,6 +39,7 @@ from typing import Optional, Sequence
 
 from monster.data.capture import Capturer, FileTransport, UrllibTransport, endpoints
 from monster.data.derive import DataError, derive
+from monster.data.doctor import diagnose
 from monster.data.probe import probe as probe_endpoints
 from monster.data.quality import audit_day, coverage, find_gaps
 from monster.data.store import Store, StoreError
@@ -243,6 +250,31 @@ def _truth(args: argparse.Namespace) -> int:
     return 0
 
 
+def _doctor(args: argparse.Namespace) -> int:
+    store = Store(args.store)
+    try:
+        diagnosis = diagnose(
+            store,
+            now=args.at,
+            interval_s=args.interval,
+            window_min=args.minutes,
+            max_age_s=args.max_age,
+            floor=args.floor,
+            coherence_window=args.window,
+            journal_path=Path(args.journal),
+            min_free_gb=args.min_free_gb,
+        )
+    except OSError as error:
+        # A path that is not a store is a question that could not be asked: the
+        # doctor must not answer "healthy" or crash its way out of a cron line.
+        print(f"data: {error}", file=sys.stderr)
+        return 2
+    print(json.dumps(diagnosis.to_dict(), indent=2, sort_keys=True) if args.json else diagnosis.describe())
+    # ``wait`` is a calendar, not a defect: a young store exits 0 here exactly as
+    # it exits 3 in the cycle, and only ``warn``/``fail`` wake a cron line.
+    return 0 if diagnosis.ok else 1
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="monster-data", description="ENRG Monster data layer: record, replay, audit")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -346,6 +378,41 @@ def _parser() -> argparse.ArgumentParser:
     )
     truth.add_argument("--json", action="store_true")
     truth.set_defaults(handler=_truth)
+
+    doctor = commands.add_parser(
+        "doctor",
+        help="one screen: is the collector delivering, and can the cycle decide right now?",
+    )
+    doctor.add_argument("--store", default="var/data")
+    doctor.add_argument(
+        "--journal",
+        default="var/journal.capture.jsonl",
+        help="the collector's own chain (never the cycle's)",
+    )
+    doctor.add_argument("--at", type=float, help="the clock to judge by (default: now)")
+    doctor.add_argument("--interval", type=float, default=60.0, help="the capture cadence")
+    doctor.add_argument("--minutes", type=float, default=60.0, help="window for coverage and gaps")
+    doctor.add_argument(
+        "--max-age",
+        type=float,
+        default=180.0,
+        help="how old the newest quote may be before the collector is behind",
+    )
+    doctor.add_argument(
+        "--window",
+        type=int,
+        default=128,
+        help="the coherence window the cycle needs (MONSTER_COHERENCE_WINDOW)",
+    )
+    doctor.add_argument("--floor", type=float, default=0.98, help="coverage floor per series")
+    doctor.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=1.0,
+        help="free space below which a growing store is at risk",
+    )
+    doctor.add_argument("--json", action="store_true")
+    doctor.set_defaults(handler=_doctor)
     return parser
 
 

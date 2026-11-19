@@ -69,7 +69,7 @@ python3 -m venv .venv
 .venv/bin/python -m monster.data --help | head -3
 ```
 
-> Команды `probe`, `capture`, `audit`, `gaps`, `derive` не импортируют
+> Команды `probe`, `capture`, `audit`, `gaps`, `doctor`, `derive` не импортируют
 > `ENRG-AI`: если соседнего репозитория на VPS нет, они работают всё равно.
 > `monster.cycle` ищет его в `../ENRG-AI`, `../../ENRG-AI` или по
 > `MONSTER_ENRG_AI`; `monster.cycle --verify` (проверка журнала) работает и без
@@ -303,6 +303,14 @@ export MONSTER_DATA_JOURNAL=var/journal.capture.jsonl
 ```bash
 cd "$HOME/entrain-core-workspace/monster"
 
+# 0. один экран: здоров ли слой данных прямо сейчас.  Восемь чтений
+#    (store, freshness, coverage, gaps, journal, readiness, truth, disk),
+#    код 0 — всё ok/wait, 1 — есть warn/fail, 2 — магазин вообще не читается.
+#    Ничего не пишет: журнал, кэш и замки не трогает, можно запускать при
+#    работающем сборщике и в любой момент дня.
+.venv/bin/python -m monster.data doctor --store var/data \
+  --journal var/journal.capture.jsonl
+
 # 1. вчерашний день целиком воспроизводится из raw
 .venv/bin/python -m monster.data audit --store var/data \
   --day "$(date -u -d yesterday +%F)"
@@ -321,6 +329,32 @@ du -sh var/data && ls var/data | tail -3
 .venv/bin/python -m monster.cycle --verify && .venv/bin/python -m monster.cycle --replay
 systemctl --failed --no-pager       # пусто — значит ничего не сломано
 ```
+
+`doctor` отвечает строкой на каждое чтение и одной строкой `[next]` в конце:
+
+```
+doctor var/data at 2026-11-17T00:39:00Z: 7 ok, 1 wait
+[ok  ] store     var/data: 1 day(s) 2026-11-17, 3 venue(s) (bybit, htx, okx); 2026-11-17: 720 raw, 480 quote, 240 funding
+[ok  ] freshness newest quote 0.0s old (limit 180s)
+[ok  ] coverage  last 19 min at 60s: 12 series, worst bybit btc-usdt-swap (perp) 20/20 (100.0%)
+[ok  ] gaps      none at 60s in the last 19 min
+[ok  ] journal   var/journal.capture.jsonl: ok, 40 event(s), last data.captured 0s ago
+[wait] readiness 0/128 aligned bar(s) at 60s: the cycle answers 3 (wait) for ~128 more min
+[ok  ] truth     4 checked, 0 flagged | 0 unmeasured
+[ok  ] disk      var/data: 0.3 MB stored, 865.8 GiB free (floor 1.0)
+[next] the store is young — the cycle answers 3 (wait) and the timer stays green: a calendar, not a fault
+```
+
+Четыре слова — весь словарь: `ok` — так и должно быть; `wait` — магазин
+моложе окна когерентности, это календарь, а не поломка (тот же факт, что код
+`3` у цикла), и он **зелёный** для кода выхода; `warn` — факт для ежедневной
+проверки, не для трёх ночи (покрытие 96 % у одной биржи, находка truth, ещё не
+начатая цепочка сборщика); `fail` — сегодняшние данные вообще не утверждение о
+рынке (котировок нет, сборщик встал, цепочка не сходится, диск полон).
+
+Покрытие и дыры считаются по **закрытым** слотам (`--at` минус один интервал):
+слот, начавшийся минуту назад, ещё не доставлен, и считать его пропавшим —
+значит видеть 98.4 % на здоровом окне.
 
 Cron (UTC, каждую ночь — по вчерашнему закрытому дню):
 
@@ -413,6 +447,10 @@ git pull                                         # или rsync заново
 | `reconcile: diverged` в `--replay` | кэш `var/state.json` и цепочка описывают разные книги | цикл сам откажет (код 2); кэш удаляем — он восстановится из цепочки (`--replay --write-state`) |
 | `reconcile: rebuilt` в логе `book.log` | кэш пропал (не расхождение) | ничего не делать: следующий цикл пересоберёт его из цепочки |
 | `cycle.not_ready` / код `3` в `cycle.log` | магазин моложе окна когерентности (128 закрытых баров) | не ошибка: юнит зелёный (`SuccessExitStatus=3`), решение появится через ~2 часа; число `… 43/128 …` в строке говорит, сколько уже есть |
+| `doctor` код `1` со строкой `[fail] freshness` | сборщик не пишет свежие котировки (в строке — возраст и лимит) | `systemctl status monster-capture`; не искать причину в магазине, пока сборщик стоит |
+| `doctor` код `2` | магазин не читается вовсе (нет прав, не каталог, битый день) | `ls -ld var/data`; это ответ «вопрос не задан», а не «данные плохи» |
+| `doctor` печатает `[wait] readiness` | магазин моложе окна когерентности — цикла ещё не было | ничего не делать: это код `3` цикла, зелёный по расписанию |
+| `doctor` строка `[warn] truth` | truth-проверка что-то нашла (или не смогла измерить) | `truth-report --day <вчера>` называет пару и число; в узком рынке z раздут — смотри ещё и bps |
 | `the freshest capture pass is N s old` (код `4`) | сборщик отстал сильнее `MONSTER_MAX_SNAPSHOT_AGE_S` | `systemctl status monster-capture`; решение на старых данных — это решение о прошлом |
 
 Важно: **одна отказавшая биржа не останавливает сбор**. В логе будет

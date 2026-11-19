@@ -43,6 +43,7 @@ from monster.data.capture import (
     endpoints,
 )
 from monster.data.derive import DataError, Derivation, derive, history_window, snapshot_from
+from monster.data.doctor import Check, Diagnosis, diagnose
 from monster.data.probe import Probe, probe
 from monster.data.quality import Audit, Coverage, Gap, audit_day, coverage, find_gaps
 from monster.data.raw import RawPayload, ShapeError, decimal, pick, timestamp_s
@@ -54,10 +55,12 @@ __all__ = [
     "Batch",
     "CaptureReport",
     "Capturer",
+    "Check",
     "Conflict",
     "Coverage",
     "DataError",
     "Derivation",
+    "Diagnosis",
     "Endpoint",
     "Failure",
     "FileTransport",
@@ -76,6 +79,7 @@ __all__ = [
     "coverage",
     "decimal",
     "derive",
+    "diagnose",
     "endpoints",
     "find_gaps",
     "history_window",
