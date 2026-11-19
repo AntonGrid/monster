@@ -13,13 +13,26 @@ BASE = 1_794_916_800.0
 DAY = "2026-11-17"
 
 
-def _pass(store: Store, offset: float, mids, *, symbol: str = "btcusdt", venues=("htx", "okx", "bybit")):
-    """One capture pass: every venue stamped with the same receive time."""
+def _pass(
+    store: Store,
+    offset: float,
+    mids,
+    *,
+    symbol: str = "btcusdt",
+    venues=("htx", "okx", "bybit"),
+    skew: float = 0.02,
+):
+    """One capture pass: each venue stamps its own book time, ``skew`` apart.
+
+    Live capture keeps the venue's timestamp (``parsers.quote_from`` never
+    relabels one), so a pass is a cluster of stamps milliseconds apart, not one
+    repeated number.  ``skew=0.0`` reproduces a store written by hand.
+    """
     stamp = BASE + offset
     store.write_quotes(
         [
-            Quote(venue=venue, symbol=symbol, bid=mid, ask=mid, ts=stamp)
-            for venue, mid in zip(venues, mids)
+            Quote(venue=venue, symbol=symbol, bid=mid, ask=mid, ts=stamp + index * skew)
+            for index, (venue, mid) in enumerate(zip(venues, mids))
         ]
     )
 
@@ -84,6 +97,36 @@ def test_two_venues_are_unmeasured_rather_than_clean(tmp_path):
     report = truth_day(store, DAY)
     assert report.sections == 0 and report.events == ()
     assert report.unmeasured == ("btcusdt",)
+
+
+def test_a_pass_is_a_cluster_of_venue_stamps_not_a_single_stamp(tmp_path):
+    """Venues answer one request with three stamps: one pass, not three.
+
+    The VPS replayed a 60 s day as 15 924 passes of one venue each, because the
+    quotes carry the venue's own book time and the report grouped by exact
+    equality.  Every symbol came out unmeasured and the gate looked like "no
+    finding: nothing to explain".
+    """
+    store = Store(tmp_path)
+    for offset in (0, 60, 120):
+        _pass(store, offset, (100.0, 100.0, 100.0), skew=1.5)  # four and a half seconds wide
+    report = truth_day(store, DAY)
+    assert (report.passes, report.sections) == (3, 3)
+    assert report.events == ()
+
+
+def test_a_venue_that_missed_the_pass_is_unmeasured_not_flagged(tmp_path):
+    """A quote 90 s late is its own pass, and it judges nothing."""
+    store = Store(tmp_path)
+    _pass(store, 0, (102.0, 100.0, 100.0))  # htx 200 bps above the crowd
+    _pass(store, 60, (100.0, 100.0), venues=("htx", "okx"))  # bybit missed this pass
+    store.write_quotes([Quote(venue="bybit", symbol="btcusdt", bid=100.0, ask=100.0, ts=BASE + 90.0)])
+    _pass(store, 120, (100.0, 100.0, 100.0))
+    report = truth_day(store, DAY)
+    # The finding is judged by the next pass that can judge it, not by a lone quote.
+    (event,) = report.events
+    assert event.verdict == "snapped_back"
+    assert "btcusdt" in report.unmeasured
 
 
 def test_the_day_is_reported_as_json_and_the_gate_exits_nonzero(tmp_path):

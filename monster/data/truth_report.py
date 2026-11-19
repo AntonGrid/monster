@@ -11,6 +11,17 @@ with a z-score.  The Phase 1 gate asks for a *false-positive* rate, so somebody
 has to say which findings were noise, and that cannot be done at the moment of
 the refusal: it is only knowable from what happened next.
 
+One pass is a cluster of stamps, not one stamp
+==============================================
+The venues stamp their own book time, so the three answers to one request carry
+three stamps a few hundred milliseconds apart.  Grouping by exact equality
+therefore made every row its own pass: the VPS replayed as 15 924 "passes" of
+one venue each for a single 60 s day, every symbol ``unmeasured``, and the gate
+could not be measured at all while the report said "no finding".  A pass is
+every quote within ``max_age_s`` (5 s) of the first unclaimed stamp — the same
+five seconds that make a quote stale, because a reading this close to the pass
+*is* the pass.
+
 So the day is replayed pass by pass, and every disagreement is classified by the
 pass that follows it:
 
@@ -205,6 +216,34 @@ def _deviation_bps(mid: float, centre: float) -> float:
     return 0.0 if centre == 0.0 else 1e4 * (mid - centre) / centre
 
 
+def _clusters(quotes: Tuple[Quote, ...], *, max_age_s: float) -> List[Tuple[Quote, ...]]:
+    """Group quotes into capture passes: a cluster of stamps, not one repeated stamp.
+
+    Live capture cannot stamp a pass with a single number: every parser keeps the
+    venue's *own* book time, so three venues answering the same request are tens
+    to hundreds of milliseconds apart.  Grouping by exact equality therefore made
+    every row its own pass — a 60 s day on the VPS replayed as 15 924 "passes" of
+    one venue each, every symbol ``unmeasured``, and a gate that could not be
+    measured at all while reporting "no finding".
+
+    So a pass is every quote within ``max_age_s`` of the first unclaimed stamp.
+    Five seconds is far below one capture interval and far above the skew between
+    venues that answered together, and it is the same five seconds truth calls a
+    stale quote: a reading this close to the pass belongs to the pass.
+    """
+    ordered = sorted(quotes, key=lambda item: item.ts)
+    clusters: List[Tuple[Quote, ...]] = []
+    index = 0
+    while index < len(ordered):
+        head = float(ordered[index].ts)
+        end = index + 1
+        while end < len(ordered) and float(ordered[end].ts) - head <= max_age_s:
+            end += 1
+        clusters.append(tuple(ordered[index:end]))
+        index = end
+    return clusters
+
+
 def _passes(
     quotes: Tuple[Quote, ...],
     *,
@@ -213,20 +252,18 @@ def _passes(
     max_deviation_bps: float,
     max_age_s: float,
 ) -> List[_Pass]:
-    """Group the day by timestamp: one capture pass is one moment.
+    """Group the day into capture passes, one pass per cluster of stamps.
 
-    Capture stamps every reading of a pass with the same receive time, so the
-    timestamp *is* the snapshot boundary.  A store written by something else
-    still groups correctly as long as its rows carry a pass stamp; rows carrying
-    per-request stamps make every venue its own section, and the report then says
-    ``unmeasured`` rather than inventing a cross-section out of nothing.
+    ``_clusters`` decides what one pass is: the venues stamp their own book time,
+    so a pass is a set of stamps within a few seconds of each other, not one
+    repeated number.  The pass's own timestamp is the *newest* stamp in the
+    cluster — a snapshot may not hold a reading from its future, and a cluster
+    that spans no more than ``max_age_s`` leaves nothing to call stale.
     """
-    grouped: Dict[float, List[Quote]] = {}
-    for quote in quotes:
-        grouped.setdefault(float(quote.ts), []).append(quote)
     passes: List[_Pass] = []
-    for ts in sorted(grouped):
-        items = tuple(sorted(grouped[ts], key=lambda item: (item.symbol, item.venue)))
+    for cluster in _clusters(quotes, max_age_s=max_age_s):
+        ts = float(cluster[-1].ts)
+        items = tuple(sorted(cluster, key=lambda item: (item.symbol, item.venue)))
         snapshot = Snapshot(ts=ts, quotes=items)
         report = cross_venue_truth(
             snapshot,
