@@ -47,6 +47,7 @@ def _doctor(
     minutes: float = 20.0,
     window: int = 4,
     max_age: float = 400.0,
+    quote_max_age: float = 5.0,
 ):
     """Run the doctor as a cron line would, as JSON, and return ``(code, payload)``."""
     capsys.readouterr()  # the tape and capture lines are not the report
@@ -55,6 +56,7 @@ def _doctor(
             "doctor", "--store", str(store), "--journal", str(journal), "--json",
             "--at", str(at), "--interval", str(interval), "--minutes", str(minutes),
             "--window", str(window), "--max-age", str(max_age),
+            "--quote-max-age", str(quote_max_age),
         ]
     )
     return code, json.loads(capsys.readouterr().out)
@@ -131,6 +133,13 @@ def test_a_stopped_collector_is_a_failure_with_the_number(tmp_path, capsys):
     assert freshness["status"] == "fail"
     assert "behind" in freshness["detail"] and "limit 400s" in freshness["detail"]
     assert "monster-capture" in freshness["hint"]
+    # And the cycle would refuse this pass before it read anything: exit code 4,
+    # said here as the same sentence with the same number.
+    readiness = _check(payload, "readiness")
+    assert readiness["status"] == "fail"
+    assert "the cycle refuses" in readiness["detail"]
+    assert "900s old" in readiness["detail"] and "limit 400s" in readiness["detail"]
+    assert "not checked" in _check(payload, "truth")["detail"]
 
 
 def test_a_gap_is_a_warning_that_names_the_hole(tmp_path, capsys):
@@ -160,6 +169,61 @@ def test_a_gap_is_a_warning_that_names_the_hole(tmp_path, capsys):
     assert gaps["status"] == "warn"
     assert "gap(s) in the last 15 min" in gaps["detail"] and "btcusdt" in gaps["detail"]
     assert _check(payload, "coverage")["status"] == "warn"
+
+
+def test_a_moment_between_two_passes_is_not_a_stale_quote(tmp_path, capsys):
+    """The VPS question, reproduced: the doctor ran 52 s after the pass.
+
+    The collector captures every 60 s and the cycle judges the pass it derived,
+    not the wall clock.  A doctor that derived at ``now`` measured quotes taken
+    52 s ago against truth's 5 s staleness limit and flagged every venue — 14
+    findings on a store whose only defect was the calendar between two passes.
+    Judged at the pass, the same store is silent.
+    """
+    store, journal_path, last = _replay(tmp_path)
+    code, payload = _doctor(capsys, store.root, journal_path, at=last + 52.4)
+
+    assert code == 0, "half a cadence late is not a finding: the interval is 300 s"
+    assert _check(payload, "freshness")["status"] == "ok"
+    assert _check(payload, "readiness")["status"] == "ok"
+    truth = _check(payload, "truth")
+    assert truth["status"] == "ok", truth["detail"]
+    assert "0 flagged" in truth["detail"] and "stale" not in truth["detail"]
+
+
+def test_a_venue_that_missed_the_pass_is_unmeasured_not_clean(tmp_path, capsys):
+    """Two venues are not a cross-section: "I could not check" is not "I checked".
+
+    Bybit's last quote is 30 s behind the rest of the pass, so the snapshot
+    drops it rather than averaging a price that no longer exists — and the
+    truth line says the symbol went unmeasured instead of calling it clean.
+    """
+    from monster.contracts import Quote
+
+    store = Store(tmp_path / "data")
+    for index in range(6):
+        ts = BASE + index * 60.0
+        quotes = [
+            Quote(venue="htx", symbol="btcusdt", bid=90_000.0 - 0.5, ask=90_000.0 + 0.5, ts=ts),
+            Quote(venue="okx", symbol="btcusdt", bid=90_002.0 - 0.5, ask=90_002.0 + 0.5, ts=ts),
+        ]
+        if index < 5:  # bybit missed the last pass
+            quotes.append(
+                Quote(venue="bybit", symbol="btcusdt", bid=89_998.0 - 0.5, ask=89_998.0 + 0.5, ts=ts)
+            )
+        store.write_quotes(quotes)
+
+    code, payload = _doctor(
+        capsys, store.root, tmp_path / "journal.jsonl",
+        at=BASE + 5 * 60.0, interval=60.0, minutes=5.0,
+    )
+
+    assert code == 1
+    truth = _check(payload, "truth")
+    assert truth["status"] == "warn"
+    assert "0 flagged" in truth["detail"], "no price disagreed; one price was absent"
+    assert "1 unmeasured" in truth["detail"] and "2 venue(s) < 3" in truth["detail"]
+    assert "three venues" in truth["hint"]
 
 
 def test_a_missing_capture_chain_is_a_warning_not_a_failure(tmp_path, capsys):

@@ -36,7 +36,7 @@ neither, so they run on a machine that only has this repository.
 
 ```bash
 cd monster
-../ENRG-AI/.venv/bin/python -m pytest          # 208 tests, no network
+../ENRG-AI/.venv/bin/python -m pytest          # 210 tests, no network
 
 # 0. One question per endpoint: does the venue answer the shape we parse, or
 #    merely answer?  It writes nothing, so it is safe to run first.
@@ -62,6 +62,10 @@ cd monster
 # One screen: is the data layer healthy *now*?  Eight readings, exit 0 when the
 # verdict is ok or wait (a young store), 1 when anything is warn or fail, 2 when
 # the store cannot be read at all.  Read-only: safe while the collector writes.
+# Readiness and truth are judged at the newest capture pass, not at the wall
+# clock, so a run 52 s after a pass is not fourteen stale venues: the pass age
+# is `--max-age` (180 s, is the collector behind?) and the quote age inside a
+# pass is `--quote-max-age` (5 s, is this snapshot about this pass?).
 ../ENRG-AI/.venv/bin/python -m monster.data doctor --store var/data \
   --journal var/journal.capture.jsonl
 MONSTER_DATA_JOURNAL=var/journal.capture.jsonl \
@@ -280,6 +284,6 @@ monster/
                       monster-book.{service,timer} is the hourly verify+replay audit,
                       monster-cycle.{service,timer} the hourly cycle (green only on 3)
   docs/VPS.md         the operator runbook: install, probe, run, check, report
-  tests/              208 tests: every refusal has one
+  tests/              210 tests: every refusal has one
   docs/MONSTER.md     charter, roadmap, integration plan, non-negotiables
 ```

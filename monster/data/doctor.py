@@ -24,7 +24,8 @@ delivering, is the chain intact, and if not, which one is it?*
                write;
 ``readiness``  can the cycle derive a snapshot, and how many aligned bars does
                the coherence window still need;
-``truth``      what the lie detector says about the newest snapshot;
+``truth``      what the lie detector says about the newest snapshot — read at the
+               capture pass it came from, not at the wall clock;
 ``disk``       how much the store occupies and how much room is left.
 
 Doctor reads and never writes: no journal line, no state, no lock.  A
@@ -72,8 +73,9 @@ __all__ = [
     "diagnose",
     "DEFAULT_FLOOR",
     "DEFAULT_MAX_AGE_S",
-    "DEFAULT_WINDOW_MIN",
     "DEFAULT_MIN_FREE_GB",
+    "DEFAULT_QUOTE_MAX_AGE_S",
+    "DEFAULT_WINDOW_MIN",
 ]
 
 #: The whole vocabulary, ordered from quiet to loud.  ``wait`` is second, not
@@ -89,6 +91,12 @@ DEFAULT_FLOOR = 0.98
 #: How old the newest quote may be before the collector is behind.  The VPS
 #: captures every 60 s, so three silent passes is a fault and one is not.
 DEFAULT_MAX_AGE_S = 180.0
+
+#: How old a quote may be *inside* a pass before the snapshot is not about that
+#: pass.  The cycle's ``MONSTER_MAX_QUOTE_AGE_S`` and truth's staleness limit:
+#: one number, because a quote the snapshot trusts and a quote truth calls stale
+#: must be the same quote.
+DEFAULT_QUOTE_MAX_AGE_S = 5.0
 
 #: The window coverage and gaps are judged over.
 DEFAULT_WINDOW_MIN = 60.0
@@ -201,6 +209,7 @@ class Diagnosis:
             "checks": [check.to_dict() for check in self.checks],
         }
 
+
 def _store_check(store: Store, days: Sequence[str]) -> Check:
     root = str(store.root)
     if not days:
@@ -256,6 +265,7 @@ def _freshness_check(newest: Optional[float], ts: float, max_age_s: float) -> Ch
         )
     return Check("freshness", "ok", f"newest quote {age:.1f}s old (limit {max_age_s:.0f}s)")
 
+
 def _coverage_check(
     store: Store,
     quotes: Sequence[Any],
@@ -310,13 +320,16 @@ def _coverage_check(
     return Check("coverage", "ok", detail)
 
 
-def _gaps_check(quotes: Sequence[Any], *, low: float, high: float, interval_s: float) -> Check:
+def _gaps_check(
+    quotes: Sequence[Any], *, low: float, high: float, interval_s: float, window_s: Optional[float] = None
+) -> Check:
     gaps = find_gaps(quotes, interval_s, since=low, until=high)
+    span = (high - low) if window_s is None else float(window_s)
     if not gaps:
-        return Check("gaps", "ok", f"none at {interval_s:g}s in the last {(high - low) / 60.0:.0f} min")
+        return Check("gaps", "ok", f"none at {interval_s:g}s in the last {span / 60.0:.0f} min")
     worst = max(gaps, key=lambda gap: gap.missing)
     detail = (
-        f"{len(gaps)} gap(s) in the last {(high - low) / 60.0:.0f} min; longest {worst.missing} "
+        f"{len(gaps)} gap(s) in the last {span / 60.0:.0f} min; longest {worst.missing} "
         f"slot(s) {worst.venue} {worst.symbol} ({worst.kind})"
     )
     return Check(
@@ -376,6 +389,8 @@ def _journal_check(path: Path, *, ts: float, max_age_s: float) -> Check:
             hint="the chain is intact but nothing has been written to it lately: is the collector still running?",
         )
     return Check("journal", "ok", detail)
+
+
 def _readiness_check(derivation: Any, *, window: int, interval_s: float) -> Check:
     bars = min((len(series) for series in derivation.history.values()), default=0)
     if bars < window:
@@ -396,24 +411,34 @@ def _readiness_check(derivation: Any, *, window: int, interval_s: float) -> Chec
 def _truth_check(derivation: Any) -> Check:
     report = cross_venue_truth(derivation.snapshot, now=derivation.at)
     unmeasured = len(report.unmeasured)
-    if not report.findings:
+    if report.findings:
+        first = report.findings[0]
+        more = f" (+{len(report.findings) - 1} more)" if len(report.findings) > 1 else ""
         return Check(
             "truth",
-            "ok",
-            f"{len(report.checked)} checked, 0 flagged | {unmeasured} unmeasured",
+            "warn",
+            f"{len(report.checked)} checked, {len(report.findings)} flagged: "
+            f"{first.venue} {first.symbol} {first.reason}{more} | {unmeasured} unmeasured",
+            hint=(
+                "a finding is a veto, not a trade: measure how often it fires with "
+                "`monster.data truth-report --max-fp-share 0.01` before moving the threshold"
+            ),
         )
-    first = report.findings[0]
-    more = f" (+{len(report.findings) - 1} more)" if len(report.findings) > 1 else ""
-    return Check(
-        "truth",
-        "warn",
-        f"{len(report.checked)} checked, {len(report.findings)} flagged: "
-        f"{first.venue} {first.symbol} {first.reason}{more} | {unmeasured} unmeasured",
-        hint=(
-            "a finding is a veto, not a trade: measure how often it fires with "
-            "`monster.data truth-report --max-fp-share 0.01` before moving the threshold"
-        ),
-    )
+    if unmeasured:
+        # "I could not check" is a different sentence from "I checked", and the
+        # module that says so is the one that measured it.  A symbol quoted by
+        # fewer venues than truth needs is not clean, however quiet it looks.
+        return Check(
+            "truth",
+            "warn",
+            f"{len(report.checked)} checked, 0 flagged | {unmeasured} unmeasured: "
+            f"{report.unmeasured[0]}",
+            hint=(
+                "a symbol needs three venues before disagreement can be told from noise: "
+                "the missing one is in the coverage line"
+            ),
+        )
+    return Check("truth", "ok", f"{len(report.checked)} checked, 0 flagged | 0 unmeasured")
 
 
 def _disk_check(root: Path, *, min_free_gb: float) -> Check:
@@ -448,6 +473,7 @@ def diagnose(
     coherence_window: int = 128,
     journal_path: Optional[Path] = None,
     min_free_gb: float = DEFAULT_MIN_FREE_GB,
+    quote_max_age_s: float = DEFAULT_QUOTE_MAX_AGE_S,
 ) -> Diagnosis:
     """Take every reading once, at the same instant, and say the worst of them.
 
@@ -459,6 +485,15 @@ def diagnose(
     a moment ago has not been delivered yet, and counting it as missing would
     make every healthy window look like 98.4 % — an alarm that fires on a
     working collector is an alarm nobody reads.
+
+    Readiness and truth are judged at the **pass**, not at the wall clock.  The
+    cycle derives its snapshot at the newest quote and then asks whether that
+    pass is recent (``MONSTER_MAX_SNAPSHOT_AGE_S``); a doctor that derived at
+    ``now`` would measure quotes taken up to one interval ago against truth's
+    5 s limit and call every venue stale once a minute.  Two limits, two
+    questions: the pass age is ``max_age_s`` (is the collector behind?), the
+    quote age inside the pass is ``quote_max_age_s`` (is this snapshot about
+    this pass?).
     """
     if interval_s <= 0.0:
         raise ValueError("interval_s must be positive")
@@ -466,6 +501,8 @@ def diagnose(
         raise ValueError("window_min must be positive")
     if coherence_window <= 0:
         raise ValueError("coherence_window must be positive")
+    if quote_max_age_s <= 0.0:
+        raise ValueError("quote_max_age_s must be positive")
 
     ts = float(time.time() if now is None else now)
     days = store.days()
@@ -474,17 +511,27 @@ def diagnose(
     newest = store.latest("quote")
     checks.append(_freshness_check(newest, ts, max_age_s))
 
-    low = ts - float(window_min) * 60.0
-    high = ts - float(interval_s)
-    if high <= low:
-        high = ts
-    quotes = store.quotes(since=low, until=ts)
+    # The window is anchored at the newest pass and a whole number of intervals
+    # wide.  Anchored at the wall clock instead, its low edge falls between two
+    # passes, the cell at that edge looks missing, and a healthy collector reads
+    # 75 % because the doctor ran 52 s after the pass.
+    cells = max(1, int(round(float(window_min) * 60.0 / interval_s)))
+    high = float(newest) if newest is not None else ts - float(interval_s)
+    low = high - float(interval_s) * (cells - 1)
+    # One slot of history is read before the window so a hole that touches its
+    # left edge is a gap with two stamps rather than an invisible edge.
+    look_back = low - float(interval_s)
+    quotes = store.quotes(since=look_back, until=ts)
     checks.append(
         _coverage_check(
             store, quotes, low=low, high=high, interval_s=interval_s, floor=floor, days=days
         )
     )
-    checks.append(_gaps_check(quotes, low=low, high=high, interval_s=interval_s))
+    checks.append(
+        _gaps_check(
+            quotes, low=look_back, high=high, interval_s=interval_s, window_s=high - low
+        )
+    )
 
     if journal_path is None:
         checks.append(Check("journal", "ok", "not checked: no capture chain was named"))
@@ -492,31 +539,54 @@ def diagnose(
         checks.append(_journal_check(Path(journal_path), ts=ts, max_age_s=max_age_s))
 
     derivation = None
-    try:
-        derivation = derive(
-            store,
-            at=ts,
-            interval_s=interval_s,
-            bars=coherence_window,
-            quote_max_age_s=max_age_s,
-        )
-    except (DataError, StoreError) as error:
+    # The cycle judges a capture pass: it derives at the newest quote and then
+    # asks whether that pass is recent (exit code 4).  The doctor says the same
+    # two things in the same order, so a green line here means the cycle runs.
+    pass_age = None if newest is None else ts - float(newest)
+    if pass_age is not None and pass_age > max_age_s:
         checks.append(
             Check(
                 "readiness",
                 "fail",
-                f"the cycle cannot derive a snapshot: {error}",
+                f"the cycle refuses: the freshest capture pass is {pass_age:.0f}s old "
+                f"(limit {max_age_s:.0f}s)",
                 hint=(
-                    "freshness and store say which half of the question failed: "
-                    "no quotes, or quotes older than the limit"
+                    "a decision on a pass this old is a decision about the past: "
+                    "`systemctl status monster-capture`, then the freshness line for how long"
                 ),
             )
         )
     else:
-        checks.append(_readiness_check(derivation, window=coherence_window, interval_s=interval_s))
+        try:
+            derivation = derive(
+                store,
+                at=None if newest is None else float(newest),
+                interval_s=interval_s,
+                bars=coherence_window,
+                quote_max_age_s=quote_max_age_s,
+            )
+        except (DataError, StoreError) as error:
+            checks.append(
+                Check(
+                    "readiness",
+                    "fail",
+                    f"the cycle cannot derive a snapshot: {error}",
+                    hint=(
+                        "freshness and store say which half of the question failed: "
+                        "no quotes, or quotes older than the limit"
+                    ),
+                )
+            )
+        else:
+            checks.append(_readiness_check(derivation, window=coherence_window, interval_s=interval_s))
 
     if derivation is None:
-        checks.append(Check("truth", "ok", "not checked: the snapshot could not be derived"))
+        reason = (
+            "the cycle refuses this pass"
+            if pass_age is not None and pass_age > max_age_s
+            else "the snapshot could not be derived"
+        )
+        checks.append(Check("truth", "ok", f"not checked: {reason}"))
     else:
         checks.append(_truth_check(derivation))
 

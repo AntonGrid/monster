@@ -263,6 +263,7 @@ def _doctor(args: argparse.Namespace) -> int:
             coherence_window=args.window,
             journal_path=Path(args.journal),
             min_free_gb=args.min_free_gb,
+            quote_max_age_s=args.quote_max_age,
         )
     except OSError as error:
         # A path that is not a store is a question that could not be asked: the
@@ -397,6 +398,12 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=180.0,
         help="how old the newest quote may be before the collector is behind",
+    )
+    doctor.add_argument(
+        "--quote-max-age",
+        type=float,
+        default=5.0,
+        help="how old a quote may be inside a pass (MONSTER_MAX_QUOTE_AGE_S)",
     )
     doctor.add_argument(
         "--window",
