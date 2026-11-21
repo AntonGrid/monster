@@ -28,9 +28,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Sequence, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
-__all__ = ["ShapeError", "RawPayload", "pick", "decimal", "timestamp_s", "KINDS"]
+__all__ = ["ShapeError", "Refused", "RawPayload", "pick", "decimal", "timestamp_s", "KINDS"]
 
 #: What an endpoint is asked for.  ``funding`` is a reading about a perp, and
 #: is kept distinct so a spot ticker can never be filed as a rate.
@@ -44,6 +44,35 @@ class ShapeError(ValueError):
     bid is not a cheap quote, it is a reading that failed, and the difference
     has to reach the operator before it reaches a strategy.
     """
+
+
+class Refused(ShapeError):
+    """The venue answered, and the answer was a refusal rather than data.
+
+    A refusal is not a schema change, and the difference decides what a
+    collector does next.  ``rate_limit`` is worth asking about again, later,
+    with a real delay; ``refused`` (a delisted instrument, a rejected
+    parameter) is not, because a second identical question gets a second
+    identical answer.  Retrying a schema change is how a feed stops being
+    watched: the retries hide the breakage behind noise.
+
+    It subclasses :class:`ShapeError` so every reader that already knows "this
+    body produced no reading" — the audit, the doctor, the capture loop —
+    keeps working unchanged, and only the code that decides *whether to ask
+    again* has to look at the subclass.
+    """
+
+    #: Kinds a later attempt can plausibly cure.  Everything else is a fact.
+    RETRYABLE = ("rate_limit",)
+
+    def __init__(self, message: str, *, kind: str = "refused", status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.kind = str(kind)
+        self.status = status
+
+    @property
+    def retryable(self) -> bool:
+        return self.kind in self.RETRYABLE
 
 
 @dataclass(frozen=True)

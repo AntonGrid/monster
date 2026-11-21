@@ -39,10 +39,48 @@ from __future__ import annotations
 from typing import Any, Callable, Mapping, Optional
 
 from monster.contracts import ContractError, FundingQuote, Quote
-from monster.data.raw import ShapeError, decimal, pick, timestamp_s
+from monster.data.raw import Refused, ShapeError, decimal, pick, timestamp_s
 from monster.instruments import InstrumentError, kinds_for
 
 __all__ = ["EmptyBook", "quote_from", "funding_from", "QUOTE_PARSERS", "FUNDING_PARSERS"]
+
+
+#: How a venue spells "ask again later".  The same refusal arrives as HTTP 429,
+#: as ``err-msg: request limit`` (HTX's swap host), as ``code 50011`` (OKX) and
+#: as ``retCode 10006`` (Bybit).  Volume is not what we assume it is — four
+#: requests a minute to one host is far under every published quota and still
+#: gets refused — so the phrase, not our own rate, is the thing worth matching.
+_LATER_HINTS = (
+    "rate limit",
+    "request limit",
+    "too many",
+    "frequent",
+    "throttl",
+    "try again",
+    "system busy",
+    "timeout",
+)
+
+#: Codes that mean "later" when the message is unhelpful.
+_LATER_CODES = {
+    "htx": ("429", "1003"),
+    "okx": ("50011", "50013"),
+    "bybit": ("10006", "10018"),
+}
+
+
+def _refusal(venue: str, status: Any, message: str, code: Any = None) -> Refused:
+    """The venue's own refusal sentence, classified by whether later can help.
+
+    The wording is the wording a reader already knows from the audit
+    (``htx refused the request: error (request limit)``), because the same line
+    has to be recognisable in a log and in a stored body; only the class says
+    what the collector may do about it.
+    """
+    text = f"{venue} refused the request: {status} ({message})"
+    haystack = f"{message} {code if code is not None else ''}".lower()
+    later = any(hint in haystack for hint in _LATER_HINTS) or str(code).strip() in _LATER_CODES.get(venue, ())
+    return Refused(text, kind="rate_limit" if later else "refused")
 
 
 class EmptyBook(ShapeError):
@@ -96,7 +134,10 @@ def _htx_envelope(payload: Any) -> None:
     status = payload.get("status")
     if status is not None and str(status).strip().lower() != "ok":
         message = payload.get("err-msg") or payload.get("err_msg") or "no message"
-        raise ShapeError(f"htx refused the request: {status} ({message})")
+        # ``err-code`` is not always a number: HTX's swap host answers a rate
+        # limit with ``invalid-parameter`` and puts the truth in ``err-msg``
+        # ("request limit"), which is why the phrase is matched as well.
+        raise _refusal("htx", status, str(message), payload.get("err-code"))
 
 
 def _htx_quote(*, payload: Any, venue: str, symbol: str, native: str, kind: str) -> Quote:
@@ -129,7 +170,7 @@ def _okx_row(payload: Any) -> Mapping[str, Any]:
     code = payload.get("code")
     if code is not None and str(code) != "0":
         message = payload.get("msg") or "no message"
-        raise ShapeError(f"okx refused the request: {code} ({message})")
+        raise _refusal("okx", code, str(message), code)
     row = pick(payload, "data.0")
     if not isinstance(row, Mapping):
         raise ShapeError("okx data[0] is not an object")
@@ -177,7 +218,7 @@ def _bybit_row(payload: Any) -> Mapping[str, Any]:
         )
     code = int(decimal("bybit retCode", payload.get("retCode")))
     if code != 0:
-        raise ShapeError(f"bybit refused the request: {code} ({payload.get('retMsg') or 'no message'})")
+        raise _refusal("bybit", code, str(payload.get("retMsg") or "no message"), code)
     row = pick(payload, "result.list.0")
     if not isinstance(row, Mapping):
         raise ShapeError("bybit result.list[0] is not an object")

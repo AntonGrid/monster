@@ -26,17 +26,32 @@ from monster.data.store import Store
 FIXTURES = Path(__file__).resolve().parents[1] / "data" / "raw-fixtures"
 FIXTURE_TS = 1_794_916_800.0
 USER_AGENT = "enrg-monster/0.2 (paper; no credentials)"
+#: The refusal HTX sent 64 times on 18.11, and ~390 more times with a status
+#: instead of a body.  It is a 429 whose reason lives in the JSON.
+THROTTLED = {"err-code": "invalid-parameter", "err-msg": "request limit", "status": "error"}
 
 
 @pytest.fixture
 def venue_server():
     """A local HTTP server that answers like the venues do: one body per path."""
-    state = {"seen": [], "fail": set()}
+    state = {"seen": [], "fail": set(), "throttle": {}}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - the name is the HTTP method
             path = self.path.split("?", 1)[0].strip("/")
             state["seen"].append((path, self.headers.get("User-Agent", "")))
+            if state["throttle"].get(path, 0) > 0:
+                # HTX's swap host is the model: a 429 with a JSON body that
+                # names the reason, and a Retry-After we can honour.
+                state["throttle"][path] -= 1
+                refusal = json.dumps(THROTTLED).encode("utf-8")
+                self.send_response(429)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Retry-After", "2")
+                self.send_header("Content-Length", str(len(refusal)))
+                self.end_headers()
+                self.wfile.write(refusal)
+                return
             if path in state["fail"]:
                 self.send_response(500)
                 self.send_header("Content-Length", "0")
@@ -98,12 +113,53 @@ def test_a_500_is_a_transport_error_and_is_retried(tmp_path, venue_server):
     wanted = tuple(item for item in _local(port) if item.name == "spot-btc" and item.venue == "htx")
     assert len(wanted) == 1
     store = Store(tmp_path / "data")
-    report = Capturer(store, UrllibTransport(timeout=5.0), retries=2, backoff_s=0.0).capture(
-        at=FIXTURE_TS, wanted=wanted
-    )
+    report = Capturer(
+        store, UrllibTransport(timeout=5.0), retries=2, sleep=lambda delay: None
+    ).capture(at=FIXTURE_TS, wanted=wanted)
     assert not report.ok and report.raw == 0 and report.written == 0
     assert "500" in report.failures[0].reason
+    assert "after 3 attempts" in report.failures[0].reason
     assert len([path for path, _ in state["seen"] if path == "htx/spot-btc"]) == 3
     # Nothing was fetched, so nothing could be stored: an absent reading is not
     # a zero reading.
     assert store.days() == ()
+
+
+def test_a_429_over_http_keeps_its_body_and_is_asked_again(tmp_path, venue_server):
+    """The costume that cost us ~390 readings on 18.11.
+
+    ``urllib`` raises on the status, so the body is only reachable through the
+    exception; dropping it is what left 64 bodies explaining a hole of 456.
+    """
+    port, state = venue_server
+    state["throttle"]["htx/spot-btc"] = 1
+    wanted = tuple(item for item in _local(port) if item.name == "spot-btc" and item.venue == "htx")
+    slept: list[float] = []
+    store = Store(tmp_path / "data")
+    report = Capturer(store, UrllibTransport(timeout=5.0), sleep=slept.append).capture(
+        at=FIXTURE_TS, wanted=wanted
+    )
+    assert report.ok and report.written == 1 and report.retried == 1
+    # The venue said "in two seconds" and the venue was believed.
+    assert slept == [2.0]
+    assert len(list(store.raws())) == 1  # the answer, not the refusal
+
+
+def test_a_429_that_never_clears_leaves_the_refusal_as_evidence(tmp_path, venue_server):
+    port, state = venue_server
+    state["throttle"]["htx/spot-btc"] = 10
+    wanted = tuple(item for item in _local(port) if item.name == "spot-btc" and item.venue == "htx")
+    slept: list[float] = []
+    store = Store(tmp_path / "data")
+    report = Capturer(store, UrllibTransport(timeout=5.0), sleep=slept.append).capture(
+        at=FIXTURE_TS, wanted=wanted
+    )
+    assert not report.ok and report.raw == 1 and report.written == 0
+    reason = report.failures[0].reason
+    assert "request limit" in reason and "after 3 attempts" in reason
+    # Three tries at the venue's own 2 s pace, and then the pass gives up
+    # rather than dragging a reading past the truth check's tolerance.
+    assert slept == [2.0, 2.0]
+    kept = list(store.raws())
+    assert kept and kept[0].body["err-msg"] == "request limit"
+

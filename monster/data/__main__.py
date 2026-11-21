@@ -94,7 +94,15 @@ def _capture(args: argparse.Namespace) -> int:
         raise ValueError("live capture needs --interval > 0")
     store = Store(args.store, fsync=args.fsync)
     transport = FileTransport(args.fixtures) if args.fixtures else UrllibTransport(timeout=args.timeout)
-    capturer = Capturer(store, transport, retries=args.retries, workers=args.workers)
+    capturer = Capturer(
+        store,
+        transport,
+        retries=args.retries,
+        backoff_s=args.backoff,
+        workers=args.workers,
+        budget_s=args.budget,
+        spacing_s=args.spacing,
+    )
     wanted = endpoints(assets=_split(args.assets), venues=_split(args.venues))
     journal = Journal(args.journal) if args.journal else None
     journal_ok = journal is None or journal.verify() == "ok"
@@ -360,7 +368,31 @@ def _parser() -> argparse.ArgumentParser:
         default=5.0,
         help="seconds per request; with two waves of workers, 5 s keeps a stalled venue inside a 60 s slot",
     )
-    capture.add_argument("--retries", type=int, default=1)
+    capture.add_argument(
+        "--retries",
+        type=int,
+        default=2,
+        help="how often a refusal or a failed request is asked again (1 s, then 2 s by default)",
+    )
+    capture.add_argument(
+        "--backoff",
+        type=float,
+        default=1.0,
+        help="the first retry delay in seconds; it doubles per attempt, and 0.5 s lands in the same limiter window",
+    )
+    capture.add_argument(
+        "--budget",
+        type=float,
+        default=4.0,
+        help="total seconds a single request may spend retrying; keep it under the gate's --max-age-s (5 s), "
+        "because a reading that arrives later than the tolerance is not a reading",
+    )
+    capture.add_argument(
+        "--spacing",
+        type=float,
+        default=0.25,
+        help="seconds between requests to the same host: HTX's swap host refuses four requests inside one instant",
+    )
     capture.add_argument(
         "--workers", type=int, default=8, help="requests in flight at once (1 = strictly sequential)"
     )

@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from monster.data.parsers import EmptyBook, funding_from, quote_from
-from monster.data.raw import ShapeError, decimal, pick, timestamp_s
+from monster.data.raw import Refused, ShapeError, decimal, pick, timestamp_s
 
 FIXTURES = Path(__file__).resolve().parents[1] / "data" / "raw-fixtures"
 STAMP = 1_794_916_800.0
@@ -209,6 +209,51 @@ def test_bybit_category_must_match_the_instrument():
     payload["result"]["category"] = "linear"
     with pytest.raises(ShapeError, match="category"):
         quote_from(venue="bybit", payload=payload, symbol="btcusdt", native="BTCUSDT", kind="spot")
+
+
+def test_the_venue_is_asked_again_only_when_it_said_later():
+    """``Refused`` carries the decision the collector needs, and nothing else.
+
+    HTX's swap host answers a rate limit with ``err-code: invalid-parameter``
+    and the truth in ``err-msg`` ("request limit"), so the phrase — not the code
+    — is what decides.  A delisted instrument is a fact, and a fact retried is
+    a fact hidden behind noise.
+    """
+    throttled = {"status": "error", "err-code": "invalid-parameter", "err-msg": "request limit", "ts": 1_794_960_912_869}
+    with pytest.raises(Refused) as caught:
+        funding_from(
+            venue="htx",
+            payload=throttled,
+            symbol="btc-usdt-swap",
+            native="BTC-USDT",
+            period_hours=8.0,
+            received_ts=STAMP,
+        )
+    assert caught.value.retryable
+    assert isinstance(caught.value, ShapeError)  # the audit still sees "no reading"
+    assert str(caught.value) == "htx refused the request: error (request limit)"
+
+    delisted = {"status": "error", "err-code": "10002", "err-msg": "invalid symbol"}
+    with pytest.raises(Refused) as caught:
+        funding_from(
+            venue="htx",
+            payload=delisted,
+            symbol="btc-usdt-swap",
+            native="BTC-USDT",
+            period_hours=8.0,
+            received_ts=STAMP,
+        )
+    assert not caught.value.retryable
+
+    bybit = {"retCode": 10006, "retMsg": "Too many visits"}
+    with pytest.raises(Refused) as caught:
+        quote_from(venue="bybit", payload=bybit, symbol="btcusdt", native="BTCUSDT", kind="spot")
+    assert caught.value.retryable
+
+    okx = {"code": "50011", "msg": "Too Many Requests", "data": []}
+    with pytest.raises(Refused) as caught:
+        quote_from(venue="okx", payload=okx, symbol="btcusdt", native="BTC-USDT", kind="spot")
+    assert caught.value.retryable
 
 
 def test_okx_error_envelope_is_refused():

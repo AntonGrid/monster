@@ -76,11 +76,15 @@ def test_a_broken_shape_is_reported_and_writes_no_reading(tmp_path):
     path.write_text(json.dumps(document), encoding="utf-8")
 
     store = Store(tmp_path / "data")
-    report = Capturer(store, FileTransport(fixtures)).capture(at=BASE)
+    slept: list[float] = []
+    report = Capturer(store, FileTransport(fixtures), sleep=slept.append).capture(at=BASE)
     assert not report.ok and len(report.failures) == 1
     assert "okx spot-btc" in report.failures[0].endpoint
     assert "no book" in report.failures[0].reason
     assert len(store.quotes()) == 11  # the evidence is kept, the reading is not
+    # A moved schema is a fact, not a delay: asking the same question again
+    # would return the same answer and hide the breakage behind a retry.
+    assert slept == [] and report.retried == 0
 
 
 def test_a_transport_that_fails_once_is_retried(tmp_path):
@@ -97,8 +101,10 @@ def test_a_transport_that_fails_once_is_retried(tmp_path):
 
     slept: list[float] = []
     report = Capturer(Store(tmp_path), Flaky(FIXTURES), sleep=slept.append).capture(at=BASE)
-    assert report.ok
-    assert slept == [0.5]
+    assert report.ok and report.retried == 1
+    # One second, not half of one: the old delay landed inside the same
+    # one-second limiter window that had just refused us.
+    assert slept == [1.0]
 
 
 def test_a_transport_that_never_answers_fails_after_the_retries(tmp_path):
@@ -117,7 +123,9 @@ def test_a_transport_that_never_answers_fails_after_the_retries(tmp_path):
     # Two Bybit tickers serve two readings each, so 16 requests are attempted
     # three times and the cached failure is reported for the remaining endpoints.
     assert transport.calls == 16 * 3
-    assert slept == [0.5, 1.0] * 16
+    # The delays double and stay inside the 4 s budget: a third try would need
+    # 4 s more, and a reading that late is not one the truth check can use.
+    assert slept == [1.0, 2.0] * 16
 
 
 def test_received_time_is_ours_and_funding_is_stamped_with_it(tmp_path):
@@ -213,3 +221,109 @@ def test_the_capture_grid_wakes_early_instead_of_drifting(monkeypatch):
     monkeypatch.setattr(capture_module, "urlopen", lambda request, timeout: Answer(b"<html>nope</html>"))
     with pytest.raises(TransportError, match="not JSON"):
         UrllibTransport().get(endpoint)
+
+
+#: The exact document HTX's swap host sent on 18.11, 64 times in one day, while
+#: the same host also refused ~390 requests with an HTTP status and no body we
+#: kept.  Both costumes are the same event, and both must reach the same verdict.
+REFUSAL = {
+    "err-code": "invalid-parameter",
+    "err-msg": "request limit",
+    "status": "error",
+    "ts": 1_794_960_912_869,
+}
+
+
+def test_a_rate_limit_document_is_asked_again_and_the_reading_survives(tmp_path):
+    class Throttled(FileTransport):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.refuse = True
+
+        def get(self, endpoint):
+            if self.refuse and endpoint.venue == "htx" and endpoint.name == "perp-btc":
+                self.refuse = False
+                return REFUSAL
+            return super().get(endpoint)
+
+    store = Store(tmp_path)
+    slept: list[float] = []
+    report = Capturer(store, Throttled(FIXTURES), sleep=slept.append).capture(at=BASE)
+    assert report.ok and report.written == 18
+    assert report.retried == 1 and slept == [1.0]
+    # The refusal was superseded by the answer, so the day keeps 18 bodies and
+    # the audit keeps its meaning: a stored body is a body that carried data.
+    assert report.raw == 18 and len(list(store.raws())) == 18
+    assert len(store.quotes()) == 12
+
+
+def test_a_refusal_that_never_heals_is_kept_as_evidence_and_named(tmp_path):
+    class AlwaysRefused(FileTransport):
+        def get(self, endpoint):
+            if endpoint.venue == "htx" and endpoint.name == "perp-btc":
+                raise TransportError(
+                    "htx perp-btc: HTTP 429 Too Many Requests",
+                    body=REFUSAL,
+                    status=429,
+                    retryable=True,
+                )
+            return super().get(endpoint)
+
+    store = Store(tmp_path)
+    slept: list[float] = []
+    report = Capturer(store, AlwaysRefused(FIXTURES), sleep=slept.append).capture(at=BASE)
+    assert not report.ok and len(report.failures) == 1
+    reason = report.failures[0].reason
+    # The sentence says both what happened and how hard we tried, so a morning
+    # reader can tell one bad minute from a chronic refusal.
+    assert "request limit" in reason and "after 3 attempts" in reason
+    assert slept == [1.0, 2.0]
+    # A 429's JSON body is evidence, not noise: it is stored, counted and
+    # re-readable, which is exactly what the 390 missing bodies were not.
+    assert report.raw == 18 and report.written == 17
+    kept = [item for item in store.raws() if item.venue == "htx" and item.endpoint == "perp-btc"]
+    assert kept and kept[0].body["err-msg"] == "request limit"
+
+
+def test_the_venues_retry_after_is_honoured_when_the_budget_allows(tmp_path):
+    class Told(FileTransport):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.refuse = True
+
+        def get(self, endpoint):
+            if self.refuse and endpoint.venue == "htx" and endpoint.name == "perp-btc":
+                self.refuse = False
+                raise TransportError("slow down", status=429, retryable=True, retry_after=3.0)
+            return super().get(endpoint)
+
+    slept: list[float] = []
+    report = Capturer(Store(tmp_path), Told(FIXTURES), sleep=slept.append).capture(at=BASE)
+    assert report.ok and slept == [3.0]
+
+
+def test_a_retry_after_beyond_the_budget_is_refused_rather_than_waited_out(tmp_path):
+    class AlwaysTold(FileTransport):
+        def get(self, endpoint):
+            if endpoint.venue == "htx" and endpoint.name == "perp-btc":
+                raise TransportError("slow down", status=429, retryable=True, retry_after=30.0)
+            return super().get(endpoint)
+
+    slept: list[float] = []
+    report = Capturer(Store(tmp_path), AlwaysTold(FIXTURES), sleep=slept.append).capture(at=BASE)
+    # Waiting 30 s would hand the pass a reading from the next slot and file it
+    # under this one: the endpoint fails this pass, and says so.
+    assert not report.ok and slept == [] and report.retried == 0
+
+
+def test_requests_to_one_host_are_spaced_instead_of_bursted(tmp_path):
+    wanted = [item for item in endpoints() if item.venue in ("htx", "okx") and item.kind == "spot"]
+    slept: list[float] = []
+    report = Capturer(Store(tmp_path), FileTransport(FIXTURES), spacing_s=0.25, sleep=slept.append).capture(
+        at=BASE, wanted=wanted
+    )
+    assert report.ok and report.written == 4
+    # Two hosts, two requests each: each host's second request waits one
+    # spacing, and neither host waits for the other.
+    assert sorted(slept) == [0.25, 0.25]
+
