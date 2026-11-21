@@ -371,12 +371,16 @@ def _judge_coverage(days: Sequence[DayEvidence], policy: Policy) -> Criterion:
         )
     short = [(name, item) for name, item in rows if item.fraction < policy.min_coverage]
     if short:
-        name, item = short[0]
+        # The worst series, not the first one in sort order: a receipt that names
+        # "htx funding-btc" when three other series are emptier sends the next
+        # hour to the wrong endpoint.
+        name, item = min(short, key=lambda pair: pair[1].fraction)
+        others = f" ({len(short)} series short)" if len(short) > 1 else ""
         return Criterion(
             "coverage",
             FAIL,
             f"{name} {item.venue} {item.symbol} ({item.kind}): {item.fraction:.2%} of "
-            f"{item.expected} slots < {policy.min_coverage:.0%}",
+            f"{item.expected} slots < {policy.min_coverage:.0%}{others}",
             {"rows": len(rows), "short": len(short), "worst_fraction": min(i.fraction for _, i in rows)},
         )
     worst = min(item.fraction for _, item in rows)

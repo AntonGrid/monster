@@ -11,6 +11,8 @@ Environment=PYTHONUNBUFFERED=1
 ExecStartPre=/bin/mkdir -p <INSTALL_DIR>/var/log
 # The day that has *closed*: today's file is still being appended to, and a
 # half-written gzip member reads as a corrupt store rather than a young one.
-ExecStart=/bin/sh -c 'exec <INSTALL_DIR>/.venv/bin/python -m monster.data audit --store var/data --day "$(date -u -d yesterday +%%F)"'
+# ``--skipped 5`` puts the refused bodies in the log: the morning after a hiccup
+# the question is "what did they send", and a count alone cannot answer it.
+ExecStart=/bin/sh -c 'exec <INSTALL_DIR>/.venv/bin/python -m monster.data audit --store var/data --skipped 5 --day "$(date -u -d yesterday +%%F)"'
 StandardOutput=append:<INSTALL_DIR>/var/log/audit.log
 StandardError=append:<INSTALL_DIR>/var/log/audit.log

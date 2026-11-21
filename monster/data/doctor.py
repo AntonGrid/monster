@@ -18,7 +18,9 @@ delivering, is the chain intact, and if not, which one is it?*
 ``coverage``   delivered slots per series over the last window, finished slots
                only — the slot that started a moment ago has not been delivered
                yet, and calling it missing would make every healthy window look
-               98.4 %;
+               98.4 %; the series are the gate's 18 (spot, perp and funding),
+               because a screen that counted 12 would call a window healthy
+               whose funding the gate will refuse at 00:10;
 ``gaps``       the runs of missing slots in that window;
 ``journal``    the collector's own chain: does it verify, and when did it last
                write;
@@ -268,7 +270,7 @@ def _freshness_check(newest: Optional[float], ts: float, max_age_s: float) -> Ch
 
 def _coverage_check(
     store: Store,
-    quotes: Sequence[Any],
+    readings: Sequence[Any],
     *,
     low: float,
     high: float,
@@ -277,14 +279,14 @@ def _coverage_check(
     days: Sequence[str],
 ) -> Check:
     window = f"{(high - low) / 60.0:.0f} min at {interval_s:g}s"
-    if not quotes:
+    if not readings:
         return Check(
             "coverage",
             "fail",
-            f"no quote in the last {window}",
+            f"no reading in the last {window}",
             hint="`systemctl status monster-capture`; freshness says how long the silence is",
         )
-    series = coverage(quotes, interval_s, since=low, until=high)
+    series = coverage(readings, interval_s, since=low, until=high)
     if not series:
         return Check("coverage", "fail", f"no series inside the last {window}")
     thin = [item for item in series if not item.ok(floor)]
@@ -321,9 +323,9 @@ def _coverage_check(
 
 
 def _gaps_check(
-    quotes: Sequence[Any], *, low: float, high: float, interval_s: float, window_s: Optional[float] = None
+    readings: Sequence[Any], *, low: float, high: float, interval_s: float, window_s: Optional[float] = None
 ) -> Check:
-    gaps = find_gaps(quotes, interval_s, since=low, until=high)
+    gaps = find_gaps(readings, interval_s, since=low, until=high)
     span = (high - low) if window_s is None else float(window_s)
     if not gaps:
         return Check("gaps", "ok", f"none at {interval_s:g}s in the last {span / 60.0:.0f} min")
@@ -522,14 +524,19 @@ def diagnose(
     # left edge is a gap with two stamps rather than an invisible edge.
     look_back = low - float(interval_s)
     quotes = store.quotes(since=look_back, until=ts)
+    # Funding is a reading of the same pass and one of the gate's three kinds:
+    # 18.11 failed on HTX funding-btc at 92.6 % while every quote series was
+    # whole, so a screen that watched 12 series would have called that window
+    # healthy for the five hours until the nightly gate named it.
+    readings: List[Any] = list(quotes) + list(store.fundings(since=look_back, until=ts))
     checks.append(
         _coverage_check(
-            store, quotes, low=low, high=high, interval_s=interval_s, floor=floor, days=days
+            store, readings, low=low, high=high, interval_s=interval_s, floor=floor, days=days
         )
     )
     checks.append(
         _gaps_check(
-            quotes, low=look_back, high=high, interval_s=interval_s, window_s=high - low
+            readings, low=look_back, high=high, interval_s=interval_s, window_s=high - low
         )
     )
 

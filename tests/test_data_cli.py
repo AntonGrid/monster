@@ -5,8 +5,11 @@ import json
 import shutil
 from pathlib import Path
 
+from monster.contracts import FundingQuote, Quote
 from monster.cycle import main as cycle_main
 from monster.data.__main__ import main as data_main
+from monster.data.raw import RawPayload
+from monster.data.store import Store
 from monster.journal import Journal
 
 BASE = 1_794_873_600.0
@@ -72,6 +75,49 @@ def test_derive_on_an_empty_store_exits_two_with_a_sentence(tmp_path, capsys):
 def test_audit_with_no_days_exits_two(tmp_path, capsys):
     assert data_main(["audit", "--store", str(tmp_path / "empty")]) == 2
     assert "no day to audit" in capsys.readouterr().err
+
+
+def test_audit_names_the_bodies_it_could_not_parse(tmp_path, capsys):
+    store = Store(tmp_path / "data")
+    store.write_raw(
+        RawPayload(
+            venue="htx",
+            endpoint="funding-btc",
+            received_ts=FIXTURE_TS,
+            body={"status": "error", "err-code": "429", "err-msg": "too many requests"},
+            symbol="btcusdt",
+            native="BTC-USDT",
+            kind="funding",
+            period_hours=8.0,
+        )
+    )
+    args = ["audit", "--store", str(store.root), "--day", "2026-11-17", "--skipped", "1"]
+    # The gate refuses a day with an unparsable body, so the nightly audit has to
+    # refuse it too — an alarm that rings on the 25th is not an alarm.
+    assert data_main(args) == 1
+    printed = capsys.readouterr().out
+    assert "htx/funding-btc" in printed and "too many requests" in printed
+    # The other question — can the store re-derive its day? — is still askable.
+    assert data_main(["audit", "--store", str(store.root), "--day", "2026-11-17", "--allow-skipped"]) == 0
+
+
+def test_gaps_only_sees_a_funding_hole_when_asked(tmp_path, capsys):
+    store = Store(tmp_path / "data")
+    store.write_quotes(
+        [Quote(venue="htx", symbol="btcusdt", bid=1.0, ask=2.0, ts=BASE + offset) for offset in (0, 60, 120)]
+    )
+    store.write_fundings(
+        [
+            FundingQuote(venue="htx", symbol="btcusdt", rate=1e-4, period_hours=8.0, ts=BASE + offset)
+            for offset in (0, 120)  # the 60 s slot never arrived
+        ]
+    )
+    window = ["--store", str(store.root), "--interval", "60", "--since", str(BASE), "--until", str(BASE + 120)]
+    assert data_main(["gaps", *window]) == 0  # quotes alone are complete
+    assert data_main(["gaps", *window, "--funding"]) == 1
+    printed = capsys.readouterr().out
+    assert "htx btcusdt (funding): 1 missing" in printed
+    assert "htx btcusdt (funding): 66.7% of 3 slots" in printed
 
 
 def test_a_cycle_reads_the_store_and_journals_its_provenance(tmp_path, demo_store, monkeypatch, capsys):

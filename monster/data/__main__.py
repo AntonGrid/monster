@@ -41,7 +41,7 @@ from monster.data.capture import Capturer, FileTransport, UrllibTransport, endpo
 from monster.data.derive import DataError, derive
 from monster.data.doctor import diagnose
 from monster.data.probe import probe as probe_endpoints
-from monster.data.quality import audit_day, coverage, find_gaps
+from monster.data.quality import audit_day, coverage, find_gaps, unparsable
 from monster.data.store import Store, StoreError
 from monster.data.synthetic import write_demo_tape
 from monster.data.truth_report import truth_day
@@ -193,25 +193,42 @@ def _audit(args: argparse.Namespace) -> int:
         return 2
     try:
         report = audit_day(store, day)
+        examples = unparsable(store, day, limit=args.skipped)
     except StoreError as error:
         print(f"data: {error}", file=sys.stderr)
         return 2
-    print(json.dumps(report.to_dict(), indent=2, sort_keys=True) if args.json else report.describe())
-    return 0 if report.ok else 1
+    if args.json:
+        payload = report.to_dict()
+        payload["unparsable"] = list(examples)
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(report.describe())
+        for line in examples:
+            print(f"  {line}")
+    # Two questions live here.  ``report.ok`` asks whether the store can
+    # re-derive its own day; the exit code asks the gate's question — whether
+    # every body in it was parsed — because a nightly audit that stays green on
+    # a day the gate will refuse is an alarm that rings after the window closes.
+    return 0 if report.ok and (args.allow_skipped or not report.skipped) else 1
 
 
 def _gaps(args: argparse.Namespace) -> int:
     store = Store(args.store)
     try:
-        quotes = store.quotes(since=args.since, until=args.until)
+        items = list(store.quotes(since=args.since, until=args.until))
+        if args.funding:
+            # A funding hole is invisible to a quote-only check, and one of them
+            # (HTX funding-btc, 18.11) is the reason this flag exists: the gate
+            # counts funding among its 18 series, so the diagnosis has to see it.
+            items.extend(store.fundings(since=args.since, until=args.until))
     except StoreError as error:
         print(f"data: {error}", file=sys.stderr)
         return 2
-    if not quotes:
+    if not items:
         print(f"data: {store.root} holds no quote in the requested window", file=sys.stderr)
         return 2
-    gaps = find_gaps(quotes, args.interval, since=args.since, until=args.until)
-    covs = coverage(quotes, args.interval, since=args.since, until=args.until)
+    gaps = find_gaps(items, args.interval, since=args.since, until=args.until)
+    covs = coverage(items, args.interval, since=args.since, until=args.until)
     payload = {"gaps": [gap.to_dict() for gap in gaps], "coverage": [item.to_dict() for item in covs]}
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -381,6 +398,18 @@ def _parser() -> argparse.ArgumentParser:
     audit.add_argument("--store", default="var/data")
     audit.add_argument("--day", help="YYYY-MM-DD (default: the newest day)")
     audit.add_argument("--json", action="store_true")
+    audit.add_argument(
+        "--skipped",
+        type=int,
+        default=0,
+        help="also print this many bodies the parser refused, with their content",
+    )
+    audit.add_argument(
+        "--allow-skipped",
+        action="store_true",
+        dest="allow_skipped",
+        help="exit 0 even when some bodies were unparsable (re-derivability only)",
+    )
     audit.set_defaults(handler=_audit)
 
     gaps = commands.add_parser("gaps", help="missing slots and coverage in a window")
@@ -388,6 +417,11 @@ def _parser() -> argparse.ArgumentParser:
     gaps.add_argument("--interval", type=float, default=60.0)
     gaps.add_argument("--since", type=float)
     gaps.add_argument("--until", type=float)
+    gaps.add_argument(
+        "--funding",
+        action="store_true",
+        help="include funding rows: the gate counts them among its 18 series",
+    )
     gaps.add_argument("--json", action="store_true")
     gaps.set_defaults(handler=_gaps)
 

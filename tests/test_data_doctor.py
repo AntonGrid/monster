@@ -171,6 +171,42 @@ def test_a_gap_is_a_warning_that_names_the_hole(tmp_path, capsys):
     assert _check(payload, "coverage")["status"] == "warn"
 
 
+def test_a_funding_hole_is_visible_on_the_same_screen(tmp_path, capsys):
+    """The gate counts 18 series: 18.11 failed on HTX funding-btc, not on a quote.
+
+    A screen that watched only spot and perp would have called that window
+    healthy — every quote was present, and one funding series had a hole in it.
+    """
+    from monster.contracts import FundingQuote, Quote
+
+    store, journal_path = Store(tmp_path / "data"), tmp_path / "journal.capture.jsonl"
+    for index in range(8):
+        stamp = BASE + index * INTERVAL
+        store.write_quotes(
+            [
+                Quote(venue=venue, symbol="btcusdt", bid=mid - 0.5, ask=mid + 0.5, ts=stamp)
+                for venue, mid in (("htx", 90_000.0), ("okx", 90_002.0), ("bybit", 89_998.0))
+            ]
+        )
+        # HTX's funding endpoint missed the pass at index 4; its quotes did not.
+        present = ("okx", "bybit") if index == 4 else ("htx", "okx", "bybit")
+        store.write_fundings(
+            [
+                FundingQuote(venue=venue, symbol="btcusdt", rate=1e-4, period_hours=8.0, ts=stamp)
+                for venue in present
+            ]
+        )
+
+    code, payload = _doctor(capsys, store.root, journal_path, at=BASE + 7 * INTERVAL)
+
+    assert code == 1
+    coverage_check = _check(payload, "coverage")
+    assert coverage_check["status"] == "warn"
+    assert "htx btcusdt (funding)" in coverage_check["detail"]
+    gaps = _check(payload, "gaps")
+    assert gaps["status"] == "warn" and "htx btcusdt (funding)" in gaps["detail"]
+
+
 def test_a_moment_between_two_passes_is_not_a_stale_quote(tmp_path, capsys):
     """The VPS question, reproduced: the doctor ran 52 s after the pass.
 

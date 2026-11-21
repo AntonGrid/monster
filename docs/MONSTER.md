@@ -44,7 +44,7 @@
    сделке — не винрейт (`autopsy.py` вернёт `unmeasurable`). «Неизмеримо» — это
    законный ответ, и он пишется в журнал.
 
-## 3. Что уже работает (v0.2, 242 теста, офлайн)
+## 3. Что уже работает (v0.2, 249 тестов, офлайн)
 
 * контракты с валидацией: перекошенный стакан, дубликат котировки, котировка
   «из будущего», intent с чужим id — отказ на входе;
@@ -137,7 +137,7 @@
 
 ### Фаза 0 — фундамент (сделано)
 
-Артефакт: `monster/` + 242 зелёных теста + пример
+Артефакт: `monster/` + 249 зелёных тестов + пример
 цикла, воспроизводимый офлайн.
 Ворота: `pytest` зелёный без сети; журнал обнаруживает правку; ни один секрет не
 читается этим пакетом.
@@ -158,7 +158,9 @@ python -m monster.data probe  --live                                      # фо
 python -m monster.data capture --live --store var/data --interval 60      # VPS
 python -m monster.data capture --fixtures data/raw-fixtures --store var/data --at <ts>
 python -m monster.data audit  --store var/data                            # raw → normalized
+python -m monster.data audit  --store var/data --day 2026-11-18 --skipped 5   # что биржа прислала вместо тела
 python -m monster.data gaps   --store var/data --interval 60
+python -m monster.data gaps   --store var/data --interval 60 --funding    # + funding: его считает гейт
 python -m monster.data derive --store var/data --snapshot-out var/s.json
 python -m monster.gate      --store var/data --day 2026-11-18 --receipt var/gate.json
 python -m monster.cycle       --store var/data --interval 60 --bars 128
@@ -187,7 +189,11 @@ python -m monster.cycle       --store var/data --interval 60 --bars 128
 * `coverage`: каждый день ≥ 1380 слотов из 1441 в каждой из 18 серий и ≥ 98 %
   доставленных; день-фрагмент — дефект, а не тихий день;
 * `audit`: 100 % нормализованных строк воспроизводятся из raw; непарсящихся
-  тел — ноль (сравнение ключей, которое не увидело тела, ничего не доказало);
+  тел — ноль (сравнение ключей, которое не увидело тела, ничего не доказало).
+  Тот же бар записан и в `audit`-команду: её код выхода 1, если в дне есть хоть
+  одно такое тело; `--allow-skipped` отвечает только на первый вопрос (exit 0,
+  когда строки воспроизводятся), а `--skipped N` печатает первые N тел целиком —
+  потому что «биржа икала» и «мы бьём по rate limit» лечатся противоположно;
 * `sample`: ≥ 90 % символ-проходов измерены (иначе доля считается по той части
   дня, которую случайно было видно);
 * funding-периоды (8/4/1 ч) сохранены в каждом чтении; `"0E-18"` читается как

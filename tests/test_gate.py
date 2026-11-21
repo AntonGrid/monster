@@ -8,6 +8,7 @@ not.  Each of those used to exit 0.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -235,6 +236,18 @@ def test_a_short_coverage_gap_fails_rather_than_averaging_out():
     verdict = judge_days([_day(fraction=0.94)])
     assert _criterion(verdict, "coverage").state == FAIL
     assert "94.0" in _criterion(verdict, "coverage").detail
+
+
+def test_a_short_day_names_the_worst_series_not_the_first_one():
+    rows = list(_coverage())
+    rows[0] = replace(rows[0], present=1300)  # 90.2 %, the first row in sort order
+    rows[-1] = replace(rows[-1], present=1200)  # 83.3 %, the actual worst
+    verdict = judge_days([replace(_day(), coverages=tuple(rows))])
+    detail = _criterion(verdict, "coverage").detail
+    assert _criterion(verdict, "coverage").state == FAIL
+    assert "83.28" in detail  # the worst series is the one named
+    assert "90.21" not in detail
+    assert "2 series short" in detail
 
 
 def test_days_are_pooled_and_named_together():

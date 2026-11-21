@@ -13,6 +13,18 @@ def test_the_collector_and_the_cycle_get_separate_chains():
     assert "--fsync" in text and "Restart=always" in text
 
 
+def test_the_nightly_audit_keeps_the_gates_bar_and_prints_the_evidence():
+    service = (DEPLOY / "monster-audit.service").read_text(encoding="utf-8")
+    start = next(line for line in service.splitlines() if line.startswith("ExecStart="))
+    # The exit code answers the gate's question — was every body parsed — so the
+    # unit may not declare that outcome green, and the log must carry the bodies
+    # themselves: "64 unparsable" with no bytes is a fact nobody can act on.
+    assert "--skipped 5" in start
+    assert "--allow-skipped" not in start
+    directives = [line.strip() for line in service.splitlines() if not line.strip().startswith("#")]
+    assert not any(line.startswith("SuccessExitStatus") for line in directives)
+
+
 def test_the_book_audit_verifies_first_and_never_softens_a_failure():
     service = (DEPLOY / "monster-book.service").read_text(encoding="utf-8")
     start = next(line for line in service.splitlines() if line.startswith("ExecStart="))

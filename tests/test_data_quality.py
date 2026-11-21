@@ -4,9 +4,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from monster.contracts import Quote
+from monster.contracts import FundingQuote, Quote
 from monster.data.capture import Capturer, FileTransport
-from monster.data.quality import audit_day, coverage, find_gaps
+from monster.data.quality import audit_day, coverage, find_gaps, unparsable
 from monster.data.raw import RawPayload
 from monster.data.store import Store
 
@@ -96,3 +96,36 @@ def test_audit_cannot_reparse_a_body_whose_request_was_not_recorded(tmp_path):
     audit = audit_day(store, DAY)
     assert audit.ok  # nothing to compare, and no lie was written
     assert len(audit.skipped) == 1 and "no request context" in audit.skipped[0]
+
+
+def test_unparsable_shows_the_body_because_the_cause_is_in_the_bytes(tmp_path):
+    store = Store(tmp_path)
+    # A venue that answers 200 with an error document instead of a reading.  The
+    # audit counts it; only the bytes say whether it was a rate limit, an outage
+    # on their side, or a schema that moved.
+    store.write_raw(
+        RawPayload(
+            venue="htx",
+            endpoint="funding-btc",
+            received_ts=BASE,
+            body={"status": "error", "err-code": "429", "err-msg": "too many requests"},
+            symbol="btcusdt",
+            native="BTC-USDT",
+            kind="funding",
+            period_hours=8.0,
+        )
+    )
+    (line,) = unparsable(store, DAY, limit=3)
+    assert line.startswith("htx/funding-btc")
+    assert "too many requests" in line  # the evidence itself, not just the count
+    assert unparsable(store, DAY, limit=0) == ()  # asking for none costs nothing
+
+
+def test_unparsable_is_capped_and_ignores_the_bodies_that_do_parse(tmp_path):
+    store = Store(tmp_path)
+    Capturer(store, FileTransport(FIXTURES)).capture(at=BASE)  # 18 bodies that parse
+    for index in range(5):
+        store.write_raw(
+            RawPayload(venue="htx", endpoint=f"mystery-{index}", received_ts=BASE + index, body={"a": 1})
+        )
+    assert len(unparsable(store, DAY, limit=2)) == 2

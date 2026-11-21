@@ -13,8 +13,8 @@
 
 | Проверка | Команда | Порог |
 |---|---|---|
-| покрытие | `python -m monster.data gaps --store var/data --interval 60` | ≥ 98 % слотов у каждого `(биржа, символ)` |
-| воспроизводимость | `python -m monster.data audit --store var/data --day <день>` | 100 % ключей: raw → normalized |
+| покрытие | `python -m monster.data gaps --store var/data --interval 60 --funding` | ≥ 98 % слотов у каждого `(биржа, символ, вид)` — включая funding, его считает гейт |
+| воспроизводимость | `python -m monster.data audit --store var/data --day <день>` | 100 % ключей: raw → normalized, и **ни одного** непарсящегося тела (иначе exit 1) |
 | сбор идёт | `tail var/log/capture.log` | строка в минуту, `18 reading(s), 18 raw body(ies)` |
 | журнал цел | `python -m monster.cycle --verify` | `ok (N events)` и `links: k ok` |
 | ворота Фазы 1 | `python -m monster.gate --store var/data --day 2026-11-20 … 2026-11-24` | exit 0 по правилам `docs/prereg/2026-11-19-truth-materiality-floor.md` |
@@ -321,8 +321,8 @@ cd "$HOME/entrain-core-workspace/monster"
 .venv/bin/python -m monster.data audit --store var/data \
   --day "$(date -u -d yesterday +%F)"
 
-# 2. покрытие и дыры за всё время
-.venv/bin/python -m monster.data gaps --store var/data --interval 60
+# 2. покрытие и дыры за всё время (включая funding: его считает гейт)
+.venv/bin/python -m monster.data gaps --store var/data --interval 60 --funding
 
 # 3. сколько уже собрано
 du -sh var/data && ls var/data | tail -3
@@ -359,7 +359,7 @@ systemctl --failed --no-pager       # пусто — значит ничего �
 doctor var/data at 2026-11-17T00:39:00Z: 7 ok, 1 wait
 [ok  ] store     var/data: 1 day(s) 2026-11-17, 3 venue(s) (bybit, htx, okx); 2026-11-17: 720 raw, 480 quote, 240 funding
 [ok  ] freshness newest quote 0.0s old (limit 180s)
-[ok  ] coverage  last 19 min at 60s: 12 series, worst bybit btc-usdt-swap (perp) 20/20 (100.0%)
+[ok  ] coverage  last 19 min at 60s: 18 series, worst bybit btc-usdt-swap (funding) 20/20 (100.0%)
 [ok  ] gaps      none at 60s in the last 19 min
 [ok  ] journal   var/journal.capture.jsonl: ok, 40 event(s), last data.captured 0s ago
 [wait] readiness 0/128 aligned bar(s) at 60s: the cycle answers 3 (wait) for ~128 more min
@@ -368,10 +368,12 @@ doctor var/data at 2026-11-17T00:39:00Z: 7 ok, 1 wait
 [next] the store is young — the cycle answers 3 (wait) and the timer stays green: a calendar, not a fault
 ```
 
-`12 series` в этой строке — котировки (3 биржи × 2 символа × spot/perp); funding
-идёт отдельным видом, и `monster.gate` считает покрытие по всем трём видам
-(`18 series`).  Числа не противоречат друг другу: doctor смотрит последние
-минуты, ворота — весь день.
+`18 series` в этой строке — те же 18, что считает `monster.gate`: 3 биржи ×
+2 символа × spot/perp/funding.  До 19.11 doctor смотрел только котировки
+(12 серий), и прогон 18.11 показал, чем это кончается: все котировки были на
+месте, а `htx funding-btc` просел до 92.6 % — и узнать об этом можно было только
+в 00:10 от ночных ворот.  Экран, который отвечает «сейчас всё хорошо», не может
+не видеть серию, по которой ворота скажут `fail`.
 
 Четыре слова — весь словарь: `ok` — так и должно быть; `wait` — магазин
 моложе окна когерентности, это календарь, а не поломка (тот же факт, что код
@@ -408,13 +410,58 @@ Cron (UTC, каждую ночь — по вчерашнему закрытом�
 
 ```cron
 10 0 * * * cd $HOME/entrain-core-workspace/monster && .venv/bin/python -m monster.data audit --store var/data --day $(date -u -d yesterday +\%F) >> var/log/audit.log 2>&1
-20 0 * * * cd $HOME/entrain-core-workspace/monster && .venv/bin/python -m monster.data gaps --store var/data --interval 60 >> var/log/gaps.log 2>&1
+20 0 * * * cd $HOME/entrain-core-workspace/monster && .venv/bin/python -m monster.data gaps --store var/data --interval 60 --funding >> var/log/gaps.log 2>&1
 30 0 * * * cd $HOME/entrain-core-workspace/monster && .venv/bin/python -m monster.data truth-report --store var/data --day $(date -u -d yesterday +\%F) >> var/log/truth.log 2>&1
 ```
 
 Почему вчерашний, а не сегодняшний: файл сегодняшнего дня в этот момент ещё
 открыт на запись, и читать его — значит читать незакрытый gzip-член. Это не
 ошибка данных, это ошибка момента.
+
+## 5a. Одна серия просела: две команды, которые говорят, что с ней делать
+
+Прогон 18.11 дал `coverage 92.64 %` на `htx funding-btc` и 64 непарсящихся тела
+из 25469.  Это два разных вопроса, и оба решаются **до** окна 20–24.11, потому
+что дыру в сборе нельзя дособрать задним числом, а непарсящиеся тела — можно
+(они лежат в `var/data` и переживут любой ремонт парсера).
+
+```bash
+cd "$HOME/entrain-core-workspace/monster"
+D=2026-11-18   # день, на котором гейт сказал fail
+S=$(.venv/bin/python -c "from monster.data.store import day_start; print(int(day_start('$D')))")
+E=$((S + 86400))
+
+# 1. где именно дыра: одна длинная или много коротких
+.venv/bin/python -m monster.data gaps --store var/data --interval 60 \
+  --funding --since "$S" --until "$E"
+
+# 2. что биржа на самом деле прислала вместо 64 тел
+.venv/bin/python -m monster.data audit --store var/data --day "$D" --skipped 5
+```
+
+Чтение результата — по одной строке, без гаданий:
+
+| что видно | что это значит | что делать |
+|---|---|---|
+| один `Gap` на 90–120 слотов подряд | площадка была недоступна ~1.5–2 ч; **ретрай не спасает**, ретрай в 0.5 с попадает в ту же дыру | ждать природу; планировать, что такой день в окне может быть один |
+| много коротких `Gap` по 1–2 слота | сборщик бил по лимиту запросов или сеть рвалась | ретрай 0.5/1.0 с (уже есть, `--retries`) + разнести запросы по времени |
+| в теле `"err-code": "429"` / `"too many requests"` | **мы** бьём по rate limit: 6 запросов в минуту на площадку у htx и okx, 4 у bybit (16 за проход на все три: funding едет в тикере) | не ретраить чаще — станет хуже; реже/последовательно для этой площадки |
+| в теле `5xx` / `{"status":"error"}` без 429 | площадка икает на своей стороне | ретрай помогает; тело уже сохранено как улика |
+| в теле **другая форма данных** (ключи переехали) | парсер отстал от схемы, данные целы | починить парсер и перечитать день из raw; сбор не трогать |
+
+Каденс сборщика при этом **не** трогать: funding — медленная величина (8 ч на
+период), и учащение проходов не заполняет дыру во времени, а только увеличивает
+число запросов — то есть усугубляет ровно ту причину, которую мы подозреваем.
+
+Важнее ретраев то, что `doctor` с 19.11 считает `coverage` и `gaps` по всем трём
+видам: та же дыра в funding видна на экране «сейчас» (`[warn] coverage …
+(funding)`), а не только в ночном отчёте.  Ретрай же проходов не лечит 200-й
+ответ с телом ошибки: `ShapeError` не повторяется вовсе — тело пишется как
+улика, и решение принимается по его содержимому, а не по второй попытке.
+
+`audit` теперь выходит с кодом 1, если в дне есть хоть одно непарсящееся тело:
+ночной таймер должен краснеть в ту же ночь, а не 25.11.  Вопрос «воспроизводится
+ли день из raw» при этом не потерян — `--allow-skipped` отвечает только на него.
 
 ## 6. Как читать отчёты
 
@@ -426,6 +473,23 @@ audit 2026-11-18: 17280/17280 keys agree (17280 raw bodies, 17280 parsed rows)
 `audit 2026-11-17: 54/54 keys agree`. Любая строка `only in raw`,
 `only normalized` или `mismatched` — стоп-сигнал: значит парсер сегодня читает
 тело иначе, чем вчера, и это надо разбирать до продолжения недели.
+
+У той же команды есть второй вопрос — разобралось ли **каждое** тело, — и он
+задан кодом выхода. День 18.11 выглядит так:
+
+```
+audit 2026-11-18: 25405/25405 keys agree (25469 raw bodies, 25405 parsed rows) · 64 unparsable raw body(ies) skipped
+  htx/funding-btc @ 1794960120: htx refused the request: error (too many requests) | {"err-code": "429", "err-msg": "too many requests", "status": "error"}
+  htx/funding-btc @ 1794960180: htx refused the request: error (too many requests) | {"err-code": "429", "err-msg": "too many requests", "status": "error"}
+```
+
+`only in raw`/`mismatched` здесь нет — магазин воспроизводит свой день, — но
+выход всё равно 1: 64 тела никто не прочитал, и ворота этот день не сертифицируют.
+Тела печатаются целиком (`--skipped 5`), потому что лечение зависит от байтов:
+`429` — это мы бьём по лимиту (реже, а не чаще), `5xx` — площадка икает (ретрай
+помогает), незнакомые ключи — отстал парсер (день перечитывается из raw, сбор не
+трогается).  Разбор — §5a.  Ночной юнит намеренно не объявляет такой выход
+успешным: таймер краснеет в ту же ночь.
 
 ```
 coverage htx btcusdt (spot): 97.9% of 1440 slots

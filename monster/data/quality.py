@@ -27,6 +27,7 @@ something rewrote a row.
 """
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -37,7 +38,16 @@ from monster.data.raw import RawPayload, ShapeError
 from monster.data.store import Store, day_start
 from monster.instruments import kind_of
 
-__all__ = ["Gap", "Coverage", "Audit", "find_gaps", "coverage", "audit_day", "DEFAULT_TOLERANCE"]
+__all__ = [
+    "Gap",
+    "Coverage",
+    "Audit",
+    "find_gaps",
+    "coverage",
+    "audit_day",
+    "unparsable",
+    "DEFAULT_TOLERANCE",
+]
 
 #: How far past the expected interval a stamp may sit before it is a hole
 #: rather than jitter.  A venue that answers at 61 s is not a missing minute.
@@ -347,5 +357,42 @@ def audit_day(store: Store, day: str) -> Audit:
         only_normalized=tuple(only_normalized),
         mismatched=tuple(mismatched),
     )
+
+
+def unparsable(store: Store, day: str, limit: int = 5) -> Tuple[str, ...]:
+    """The raw bodies the parser refused, and enough of them to name the cause.
+
+    ``audit_day`` says *how many* bodies were skipped and why in one sentence;
+    this says *what the venue actually sent*, because "the venue answered 200
+    with an error document" (a rate limit, an outage on their side) and "the
+    schema moved" (our parser) are different repairs with different urgency, and
+    the difference lives in the bytes — which is the only reason the bytes are
+    kept.  The list is capped: five bodies identify a pattern, ten thousand
+    spell it out one row at a time.
+    """
+    if limit <= 0:
+        return ()
+    start = day_start(day)
+    end = start + 86_400.0
+    found: List[str] = []
+    for record in store.records(kind="raw", since=start - 86_400.0, until=end):
+        payload = RawPayload.from_dict({name: value for name, value in record.items() if name != "record"})
+        if not start <= payload.received_ts < end:
+            continue
+        if not payload.parsable:
+            reason = "no request context in the raw record: cannot be re-parsed at all"
+        else:
+            try:
+                _reparse(payload)
+                continue
+            except ShapeError as error:
+                reason = str(error)
+        head = json.dumps(payload.body, sort_keys=True, ensure_ascii=False)
+        if len(head) > 160:
+            head = head[:160] + "…"
+        found.append(f"{payload.venue}/{payload.endpoint} @ {payload.received_ts:.0f}: {reason} | {head}")
+        if len(found) >= limit:
+            break
+    return tuple(found)
 
 
